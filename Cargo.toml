@@ -1,0 +1,36 @@
+[package]
+name = "pipewire-vircam"
+version = "0.1.0"
+edition = "2021"
+description = "Create a PipeWire virtual camera from Rust: register a camera node and fill its frames from your own code"
+license = "Apache-2.0"
+documentation = "https://docs.rs/pipewire-vircam"
+homepage = "https://github.com/simon3z/pipewire-vircam"
+repository = "https://github.com/simon3z/pipewire-vircam"
+authors = ["Federico Simoncelli <federico.simoncelli@gmail.com>"]
+categories = ["api-bindings"]
+keywords = ["pipewire", "virtual-camera", "video", "spa"]
+readme = "README.md"
+# The C reference + E2E harness are repo tooling, not crate content: they
+# don't compile into the library and a consumer doesn't need them. (The
+# `redcam` bin and `examples/` *are* part of the crate and stay in.)
+exclude = ["reference/", "ci.sh", "e2e.sh", "Makefile"]
+
+# Two direct dependencies, both from the official PipeWire Rust stack:
+#   pipewire  - the PipeWire client runtime (pw_* node/stream APIs).
+#   libspa    - the SPA POD/video types (VideoFormat, VideoInfoRaw, Buffer/Data).
+# `v1_2_0` is the shallowest version feature that exposes the pw_stream_* and
+# spa APIs we use; gating both crates to the same version keeps their `-sys`
+# FFI surfaces consistent. The large transitive set (bindgen, clang-sys,
+# libloading, the *-sys crates, system-deps, ...) is the build-time FFI
+# binding generator for those `-sys` crates - inherent to using the official
+# crate, not a removable dependency.
+
+[dependencies]
+pipewire = { version = "0.10", features = ["v1_2_0"] }
+libspa = { version = "0.10", features = ["v1_2_0"] }
+
+# Benchmarks run under `cargo test --benches` (no external bench harness;
+# they are plain #[test] functions with timing assertions).
+[[bench]]
+name = "hot_path"

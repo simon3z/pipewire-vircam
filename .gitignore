@@ -1,0 +1,8 @@
+# build artifacts
+redcam
+redcam-test
+redcam-c
+target/
+
+# local-only context (not shipped / not committed)
+.context-local/
