@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         modes: vec![Mode {
             width: 1920,
             height: 1080,
-            fps: 30,
+            fps: vec![30],
             formats: vec![Format::Rgba],
         }],
         max_buffers: 4,

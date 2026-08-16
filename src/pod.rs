@@ -23,7 +23,7 @@ use pipewire::spa::{
     utils::{Choice, ChoiceEnum, Fraction, Rectangle, SpaTypes},
 };
 
-use crate::{Format, Mode};
+use crate::Format;
 
 /// Hard ceiling on `Config::max_buffers` (keeps the SPA range sane).
 pub const MAX_BUFFERS: i32 = 16;
@@ -33,8 +33,9 @@ fn video_format(f: Format) -> VideoFormat {
         .expect("Format always maps to a VideoFormat")
 }
 
-/// One `EnumFormat` Format object with plain (fixed) values.
-pub fn enumformat_pod(format: Format, mode: &Mode) -> Vec<u8> {
+/// One `EnumFormat` Format object with plain (fixed) values for a single
+/// (format, size, fps) combination.
+pub fn enumformat_pod(format: Format, width: u32, height: u32, fps: u32) -> Vec<u8> {
     let obj = pw::spa::pod::object!(
         SpaTypes::ObjectParamFormat,
         ParamType::EnumFormat,
@@ -44,18 +45,12 @@ pub fn enumformat_pod(format: Format, mode: &Mode) -> Vec<u8> {
         pw::spa::pod::property!(
             FormatProperties::VideoSize,
             Rectangle,
-            Rectangle {
-                width: mode.width,
-                height: mode.height
-            }
+            Rectangle { width, height }
         ),
         pw::spa::pod::property!(
             FormatProperties::VideoFramerate,
             Fraction,
-            Fraction {
-                num: mode.fps,
-                denom: 1
-            }
+            Fraction { num: fps, denom: 1 }
         ),
     );
     serialize(obj)
@@ -144,19 +139,13 @@ pub fn serialize(obj: Object) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Format, Mode};
     use libspa::param::video::VideoInfoRaw;
 
-    /// A distinctive mode: width != height != fps, so a size/framerate swap
-    /// or a "denom always 1" assumption is caught by the round-trip.
-    fn mode() -> Mode {
-        Mode {
-            width: 384,
-            height: 272,
-            fps: 47,
-            formats: Vec::new(),
-        }
-    }
+    /// A distinctive geometry: width != height != fps, so a size/framerate
+    /// swap or a "denom always 1" assumption is caught by the round-trip.
+    const W: u32 = 384;
+    const H: u32 = 272;
+    const FPS: u32 = 47;
 
     /// `enumformat_pod` must serialize to a POD that the video-format parser
     /// reads back as the exact (format, size, fps) we asked for — the OBS
@@ -164,8 +153,7 @@ mod tests {
     #[test]
     fn enumformat_pod_roundtrip() {
         for f in Format::all() {
-            let m = mode();
-            let blob = enumformat_pod(*f, &m);
+            let blob = enumformat_pod(*f, W, H, FPS);
             let pod = Pod::from_bytes(&blob).expect("serialize should round-trip");
             let mut info = VideoInfoRaw::default();
             info.parse(pod)
@@ -175,10 +163,27 @@ mod tests {
                 video_format(*f),
                 "format id mismatch for {f:?}"
             );
-            assert_eq!(info.size().width, m.width);
-            assert_eq!(info.size().height, m.height);
-            assert_eq!(info.framerate().num, m.fps);
+            assert_eq!(info.size().width, W);
+            assert_eq!(info.size().height, H);
+            assert_eq!(info.framerate().num, FPS);
             assert_eq!(info.framerate().denom, 1);
+        }
+    }
+
+    /// Two fps values for the same (format, size) must serialize to distinct
+    /// PODs carrying the exact framerate — the multi-fps regression guard.
+    #[test]
+    fn enumformat_pod_multi_fps() {
+        for fps in [15u32, 30, 60] {
+            let blob = enumformat_pod(Format::Rgba, W, H, fps);
+            let pod = Pod::from_bytes(&blob).expect("serialize should round-trip");
+            let mut info = VideoInfoRaw::default();
+            info.parse(pod)
+                .expect("EnumFormat must parse as a video format");
+            assert_eq!(info.framerate().num, fps);
+            assert_eq!(info.framerate().denom, 1);
+            assert_eq!(info.size().width, W);
+            assert_eq!(info.size().height, H);
         }
     }
 

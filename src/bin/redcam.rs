@@ -108,7 +108,7 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
     Ok(Mode {
         width: w,
         height: h,
-        fps,
+        fps: vec![fps],
         formats: Format::all().to_vec(),
     })
 }
@@ -149,7 +149,7 @@ fn main() {
         modes.push(Mode {
             width: 1920,
             height: 1080,
-            fps: 30,
+            fps: vec![30],
             formats: Format::all().to_vec(),
         });
     }

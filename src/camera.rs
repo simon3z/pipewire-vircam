@@ -15,7 +15,7 @@ use pipewire::spa::{
     utils::{Direction, SpaTypes},
 };
 
-use crate::{error::Error, pod, Config, Format, Mode, Negotiated};
+use crate::{error::Error, pod, Config, Format, Negotiated};
 
 /// One plane of a raw video frame.
 ///
@@ -171,8 +171,13 @@ fn validate(config: &Config) -> Result<(), Error> {
         if mode.width == 0 || mode.height == 0 {
             return Err(Error::InvalidConfig("mode size must be nonzero".into()));
         }
-        if mode.fps == 0 {
-            return Err(Error::InvalidConfig("mode fps must be nonzero".into()));
+        if mode.fps.is_empty() {
+            return Err(Error::InvalidConfig("mode needs at least one fps".into()));
+        }
+        if mode.fps.contains(&0) {
+            return Err(Error::InvalidConfig(
+                "mode fps values must be nonzero".into(),
+            ));
         }
         if mode.formats.is_empty() {
             return Err(Error::InvalidConfig(
@@ -232,23 +237,18 @@ impl Camera {
         // Deduplicate (format, size, fps) combinations before advertising.
         let mut advertised: Vec<(Format, u32, u32, u32)> = Vec::new();
         for mode in &config.modes {
-            for &format in &mode.formats {
-                let entry = (format, mode.width, mode.height, mode.fps);
-                if !advertised.contains(&entry) {
-                    advertised.push(entry);
+            for &fps in &mode.fps {
+                for &format in &mode.formats {
+                    let entry = (format, mode.width, mode.height, fps);
+                    if !advertised.contains(&entry) {
+                        advertised.push(entry);
+                    }
                 }
             }
         }
         let mut param_blobs: Vec<Vec<u8>> = Vec::new();
         for &(format, width, height, fps) in &advertised {
-            // `enumformat_pod` only reads the mode's width/height/fps.
-            let mode = Mode {
-                width,
-                height,
-                fps,
-                formats: vec![format],
-            };
-            param_blobs.push(pod::enumformat_pod(format, &mode));
+            param_blobs.push(pod::enumformat_pod(format, width, height, fps));
         }
         param_blobs.push(pod::meta_pod());
 

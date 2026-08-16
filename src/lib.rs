@@ -8,13 +8,13 @@
 //! // Note: `negotiated` is the per-frame negotiation snapshot (format,
 //! // size, fps, stride) — see [`Negotiated`].
 //!
-//! // 1080p@30 and 720p@30.
+//! // 1080p@30/60 and 720p@30.
 //! let config = Config {
 //!     name: "mycam".into(),
 //!     media_name: "My Virtual Camera".into(),
 //!     modes: vec![
-//!         Mode { width: 1920, height: 1080, fps: 30, formats: vec![Format::Rgba, Format::Bgra] },
-//!         Mode { width: 1280, height: 720, fps: 30, formats: vec![Format::Rgba] },
+//!         Mode { width: 1920, height: 1080, fps: vec![30, 60], formats: vec![Format::Rgba, Format::Bgra] },
+//!         Mode { width: 1280, height: 720, fps: vec![30], formats: vec![Format::Rgba] },
 //!     ],
 //!     max_buffers: 4,
 //! };
@@ -221,15 +221,16 @@ impl std::str::FromStr for Format {
     }
 }
 
-/// One advertised (resolution, framerate, formats) combination.
+/// One advertised (resolution, framerates, formats) combination.
 #[derive(Clone, Debug)]
 pub struct Mode {
     pub width: u32,
     pub height: u32,
-    /// Framerate in whole frames per second. Advertised as `fps/1`; the
-    /// negotiated rate (`Negotiated::fps_num/fps_denom`) may differ, and
-    /// consumers pick it within what you advertise.
-    pub fps: u32,
+    /// Framerates in whole frames per second (>= 1). Each is advertised
+    /// separately as `fps/1`; the negotiated rate
+    /// (`Negotiated::fps_num/fps_denom`) may differ, and consumers pick it
+    /// within what you advertise.
+    pub fps: Vec<u32>,
     /// Formats offered for this size/framerate (>= 1).
     pub formats: Vec<Format>,
 }
