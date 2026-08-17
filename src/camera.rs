@@ -160,6 +160,23 @@ pub struct Camera {
     neg_cb: Box<dyn FnMut(&Negotiated)>,
 }
 
+/// A handle to signal the main loop to quit, usable from any callback
+/// (state, negotiated, fill). Capture it via [`Camera::quit_handle`] and move
+/// it into your closure before [`Camera::run`] (which consumes the camera).
+#[derive(Clone)]
+pub struct QuitHandle {
+    mainloop: pw::main_loop::MainLoopRc,
+}
+
+impl QuitHandle {
+    /// Signal the main loop to quit, causing [`Camera::run`] to return. The
+    /// camera node is torn down when `run` returns. Safe to call from any
+    /// callback (state, negotiated, fill).
+    pub fn quit(&self) {
+        self.mainloop.quit();
+    }
+}
+
 fn validate(config: &Config) -> Result<(), Error> {
     if config.name.is_empty() {
         return Err(Error::InvalidConfig("name must not be empty".into()));
@@ -281,6 +298,15 @@ impl Camera {
     /// the camera node is torn down when `run` returns.
     pub fn quit(&self) {
         self.mainloop.quit();
+    }
+
+    /// A [`QuitHandle`] for quitting the camera from a callback (state,
+    /// negotiated, fill). Capture it *before* [`Camera::run`] (which consumes
+    /// `self`) and move it into your closure.
+    pub fn quit_handle(&self) -> QuitHandle {
+        QuitHandle {
+            mainloop: self.mainloop.clone(),
+        }
     }
 
     /// Register a "negotiated" callback. Called whenever a connected

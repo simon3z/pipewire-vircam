@@ -54,7 +54,7 @@ mod camera;
 mod error;
 mod pod;
 
-pub use camera::{Camera, Frame, Plane, State};
+pub use camera::{Camera, Frame, Plane, QuitHandle, State};
 pub use error::Error;
 
 /// A raw (uncompressed) video format the camera can produce.
@@ -277,7 +277,18 @@ impl Negotiated {
 
 #[cfg(test)]
 mod tests {
-    use super::{Format, ALL_FORMATS};
+    use super::{Format, QuitHandle, ALL_FORMATS};
+
+    /// `QuitHandle` must be `'static` so a daemon can move it into a `'static`
+    /// fill closure. (The crate's callbacks only require `'static`, not
+    /// `Send`: the fill runs on the same thread that calls `Camera::run`, so
+    /// the `Rc`-backed `MainLoopRc` inside never crosses a thread.)
+    /// Compile-time check (no runtime work).
+    #[test]
+    fn quit_handle_is_static() {
+        fn assert_static<T: 'static>() {}
+        assert_static::<QuitHandle>();
+    }
 
     /// Every supported `Format` maps back to itself via its SPA id.
     #[test]
