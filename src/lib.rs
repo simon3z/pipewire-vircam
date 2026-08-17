@@ -170,7 +170,7 @@ impl Format {
     }
 
     /// The format's lowercase name (`"rgba"`, `"nv12"`, ...). Inverse of
-    /// [`Format::from_str`].
+    /// `Format::from_str`.
     pub fn as_str(self) -> &'static str {
         match self {
             Format::Rgba => "rgba",

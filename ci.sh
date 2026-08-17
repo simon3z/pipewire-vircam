@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo package --allow-dirty
 cargo test --benches
 

@@ -1,7 +1,9 @@
 //! `redcam` — solid red 1080p30 virtual camera built on the `pipewire-vircam` crate.
 //!
 //! Usage:
-//!   redcam [--name NAME] [--mode WxH@FPS]...
+//! ```text
+//! redcam [--name NAME] [--mode WxH@FPS]...
+//! ```
 //!
 //! Default: one mode, 1920x1080@30, all supported raw formats
 //! (RGBA/BGRA/BGRx/RGBx/BGR/RGB/I420/NV12/NV21/YUY2/UYVY/GREY).
