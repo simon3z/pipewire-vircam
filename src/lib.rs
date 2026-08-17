@@ -110,11 +110,10 @@ const ALL_FORMATS: &[Format] = &[
 
 impl Format {
     /// The libspa `VideoFormat` this maps to (single source of truth for the
-    /// SPA id). `None` is impossible for a `Format`, but the signature keeps
-    /// the inverse mapping honest.
-    fn video_format(self) -> Option<libspa::param::video::VideoFormat> {
+    /// SPA id).
+    fn video_format(self) -> libspa::param::video::VideoFormat {
         use libspa::param::video::VideoFormat as V;
-        Some(match self {
+        match self {
             Format::Rgba => V::RGBA,
             Format::Bgra => V::BGRA,
             Format::Bgrx => V::BGRx,
@@ -127,7 +126,7 @@ impl Format {
             Format::Yuy2 => V::YUY2,
             Format::Uvyvy => V::UYVY,
             Format::Grey => V::GRAY8,
-        })
+        }
     }
 
     /// The plane layout for this format at `width x height`: one
@@ -161,9 +160,7 @@ impl Format {
     /// The SPA format id this maps to (`SPA_VIDEO_FORMAT_*`). Derived from the
     /// libspa constant, not hardcoded.
     pub fn spa_id(self) -> u32 {
-        self.video_format()
-            .expect("Format always maps to a VideoFormat")
-            .as_raw()
+        self.video_format().as_raw()
     }
 
     /// Inverse of [`Format::spa_id`]: the `Format` for a SPA id, or `None` if
@@ -171,15 +168,7 @@ impl Format {
     fn from_spa_id(id: u32) -> Option<Format> {
         ALL_FORMATS.iter().copied().find(|f| f.spa_id() == id)
     }
-}
 
-impl std::fmt::Display for Format {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl Format {
     /// The format's lowercase name (`"rgba"`, `"nv12"`, ...). Inverse of
     /// [`Format::from_str`].
     pub fn as_str(self) -> &'static str {
@@ -197,6 +186,12 @@ impl Format {
             Format::Uvyvy => "uyvy",
             Format::Grey => "grey",
         }
+    }
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 

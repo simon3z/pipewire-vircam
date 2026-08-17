@@ -33,34 +33,38 @@ fn fill_packed(p: &mut Plane, pattern: &[u8]) {
     }
 }
 
+/// The "red" byte pattern for a single-plane format (one entry per
+/// pixel/group). YUV values are the BT.709 limited-range red equivalent.
+fn red_pattern(format: Format) -> Option<&'static [u8]> {
+    match format {
+        Format::Rgba => Some(&[255, 0, 0, 255]),
+        Format::Bgra => Some(&[0, 0, 255, 255]),
+        Format::Bgrx => Some(&[0, 0, 255, 0]),
+        Format::Rgbx => Some(&[255, 0, 0, 0]),
+        Format::Bgr => Some(&[0, 0, 255]),
+        Format::Rgb => Some(&[255, 0, 0]),
+        Format::Yuy2 => Some(&[63, 104, 63, 240]),
+        Format::Uvyvy => Some(&[104, 63, 240, 63]),
+        _ => None,
+    }
+}
+
 /// Fill every plane of the frame with the solid-red representation for the
-/// negotiated format. YUV values are BT.609/BT.709 full-range "red".
+/// negotiated format.
 fn fill_red(frame: &mut pipewire_vircam::Frame, _negotiated: &pipewire_vircam::Negotiated) {
     match frame.format {
-        // Packed RGB family: per-pixel byte pattern.
-        Format::Rgba | Format::Bgra | Format::Bgrx | Format::Rgbx | Format::Bgr | Format::Rgb => {
-            // Per-pixel byte pattern (length = bytes/pixel for this format).
-            let pattern: Vec<u8> = match frame.format {
-                Format::Rgba => vec![255, 0, 0, 255],
-                Format::Bgra => vec![0, 0, 255, 255],
-                Format::Bgrx => vec![0, 0, 255, 0],
-                Format::Rgbx => vec![255, 0, 0, 0],
-                Format::Bgr => vec![0, 0, 255],
-                Format::Rgb => vec![255, 0, 0],
-                _ => unreachable!(),
-            };
-            let p = &mut frame.planes[0];
-            let bpp = pattern.len();
-            let n = p.stride as usize * p.height as usize;
-            let mut i = 0;
-            while i < n {
-                for (k, &v) in pattern.iter().enumerate() {
-                    if i + k < n {
-                        p.data[i + k] = v;
-                    }
-                }
-                i += bpp;
-            }
+        // Packed single-plane formats: repeat the byte pattern.
+        Format::Rgba
+        | Format::Bgra
+        | Format::Bgrx
+        | Format::Rgbx
+        | Format::Bgr
+        | Format::Rgb
+        | Format::Yuy2
+        | Format::Uvyvy => {
+            let pattern =
+                red_pattern(frame.format).expect("single-plane formats all have a red pattern");
+            fill_packed(&mut frame.planes[0], pattern);
         }
         // I420: Y plane, U plane, V plane. Red = Y=63 U=104 V=240 (BT.709 limited).
         Format::I420 => {
@@ -77,14 +81,6 @@ fn fill_red(frame: &mut pipewire_vircam::Frame, _negotiated: &pipewire_vircam::N
         Format::Nv21 => {
             fill_solid(&mut frame.planes[0], 63);
             fill_packed(&mut frame.planes[1], &[240, 104]);
-        }
-        // YUY2: Y U Y V per 2px.
-        Format::Yuy2 => {
-            fill_packed(&mut frame.planes[0], &[63, 104, 63, 240]);
-        }
-        // UYVY: U Y V Y per 2px.
-        Format::Uvyvy => {
-            fill_packed(&mut frame.planes[0], &[104, 63, 240, 63]);
         }
         // GREY: solid luma.
         Format::Grey => {
@@ -168,10 +164,9 @@ fn main() {
 
     if let Err(e) = cam
         .on_state(|st: State| match st {
-            State::Disconnected { error } => match error {
-                Some(msg) => println!("stream state: \"error\" {msg}"),
-                None => println!("stream state: \"unconnected\""),
-            },
+            // The crate already logs `stream state: "error" <msg>` for errors.
+            State::Disconnected { error: Some(_) } => {}
+            State::Disconnected { error: None } => println!("stream state: \"unconnected\""),
             State::Paused { node_id } => {
                 if !NODE_PRINTED.swap(true, Ordering::SeqCst) {
                     println!("node id: {node_id}");

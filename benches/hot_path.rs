@@ -1,12 +1,12 @@
-//! Benchmarks for the per-frame hot path and negotiation setup cost.
+//! Benchmarks for the per-frame hot path.
 //!
-//! These measure pure-Rust operations that run on every frame (or every
-//! negotiation) so we can catch regressions without a live PipeWire session.
+//! These measure pure-Rust operations that run on every frame so we can
+//! catch regressions without a live PipeWire session.
 //!
-//! Run with: `cargo bench` or as part of `make test` (the harness invokes
-//! them via `cargo test --benches`).
+//! They are plain `#[test]` functions with timing assertions; run them with
+//! `cargo test --benches` (part of `ci.sh` / `make test`).
 
-use pipewire_vircam::{Format, Mode, Negotiated};
+use pipewire_vircam::{Format, Negotiated};
 
 /// Measure `Format::planes()` — called once per buffer in the `process`
 /// callback to determine the plane layout. This is pure arithmetic but we
@@ -37,44 +37,6 @@ fn bench_format_planes() {
     assert!(
         ns_per_call < 50,
         "Format::planes took {ns_per_call} ns — likely a regression"
-    );
-}
-
-/// Measure the POD serialization cost (negotiation path). This runs once per
-/// consumer connect/renegotiate, not per frame, but we want to ensure it
-/// stays cheap enough that reconnect storms don't stall.
-#[test]
-fn bench_pod_serialization() {
-    // We can't call pod::serialize directly (private module), so we measure
-    // the public API surface: building a Config and Camera is where PODs get
-    // built. But Camera::new requires PipeWire, so instead we benchmark the
-    // pure arithmetic that dominates the POD body construction.
-
-    // The enumformat_pod body is ~6 properties with integer values; the
-    // serialization is dominated by copying those into a Vec<u8>. We
-    // approximate by measuring the allocation + fill pattern.
-    let mode = Mode {
-        width: 1920,
-        height: 1080,
-        fps: vec![30],
-        formats: vec![Format::Rgba],
-    };
-
-    let start = std::time::Instant::now();
-    let iterations = 100_000;
-    for _ in 0..iterations {
-        // This mirrors what Camera::new does per (format, size, fps) combo.
-        let planes = mode.formats[0].planes(mode.width, mode.height);
-        black_box(planes);
-    }
-    let elapsed = start.elapsed();
-    let ns_per_call = elapsed.as_nanos() as u64 / iterations;
-
-    println!("Mode plane layout (negotiation setup): {ns_per_call} ns/call");
-    // Should be trivially fast (< 100ns).
-    assert!(
-        ns_per_call < 100,
-        "Negotiation setup took {ns_per_call} ns — likely a regression"
     );
 }
 

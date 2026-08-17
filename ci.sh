@@ -10,7 +10,7 @@ cargo package --allow-dirty
 cargo test --benches
 
 # Cognitive complexity threshold (arborist).
-# Most complex function: run() = 17.
+# Most complex function: redcam main() = 15.
 arborist src/ --threshold 20 --exceeds-only
 
 echo "✓ All checks passed."

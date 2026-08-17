@@ -41,4 +41,4 @@ clean:
 	rm -f redcam-c redcam-test
 	cargo clean
 
-.PHONY: all redcam fmt clippy package test bench clean
+.PHONY: all redcam fmt clippy package test e2e clean

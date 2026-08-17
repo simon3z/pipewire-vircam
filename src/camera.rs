@@ -234,23 +234,7 @@ impl Camera {
         // EnumFormat params: one plain-value Format object per
         // (format, size, fps) combination (OBS requires plain values),
         // plus a `ParamMeta` (Header) request.
-        // Deduplicate (format, size, fps) combinations before advertising.
-        let mut advertised: Vec<(Format, u32, u32, u32)> = Vec::new();
-        for mode in &config.modes {
-            for &fps in &mode.fps {
-                for &format in &mode.formats {
-                    let entry = (format, mode.width, mode.height, fps);
-                    if !advertised.contains(&entry) {
-                        advertised.push(entry);
-                    }
-                }
-            }
-        }
-        let mut param_blobs: Vec<Vec<u8>> = Vec::new();
-        for &(format, width, height, fps) in &advertised {
-            param_blobs.push(pod::enumformat_pod(format, width, height, fps));
-        }
-        param_blobs.push(pod::meta_pod());
+        let param_blobs = pod::advertised_param_blobs(&config);
 
         // The safe `connect`'s `&mut [&Pod]` argument cannot be built from
         // owned PODs in pipewire 0.10, so call the C function with a
@@ -326,208 +310,241 @@ impl Camera {
     /// PipeWire main-loop thread; keep them fast and make any captured
     /// state `Send`-safe (the listener user data crosses into that thread).
     pub fn run(self, fill: impl FnMut(&mut Frame, &Negotiated) + 'static) -> Result<(), Error> {
-        let stream = self.stream.clone();
-        let pacing = self.pacing.clone();
-        let pacing2 = self.pacing.clone();
-
-        // Driver timer: armed at 1 ms; the callback produces at most one
-        // frame per negotiated period (software pacing, so fps can change
-        // with renegotiation without re-arming).
-        let s = stream.clone();
-        let timer = self.mainloop.loop_().add_timer(move |_exps| {
-            if !pacing.streaming.load(Ordering::SeqCst) {
-                return;
-            }
-            let period = pacing.period_ns.load(Ordering::SeqCst);
-            if period == 0 {
-                return;
-            }
-            let now = now_ns();
-            let next = pacing.next_due.load(Ordering::SeqCst);
-            if now < next {
-                return;
-            }
-            // Advance past any missed periods (no catch-up bursts).
-            let missed = (now - next) / period;
-            pacing
-                .next_due
-                .store(next + (missed + 1) * period, Ordering::SeqCst);
-            let _ = s.trigger_process();
-        });
-        let _ = timer.update_timer(
-            Some(Duration::from_millis(1)),
-            Some(Duration::from_millis(1)),
-        );
-
-        // Quit the main loop on SIGINT/SIGTERM (like the C reference). The
-        // `SignalSource`s unregister the handler on drop, so they must stay
-        // alive for the whole loop; hold them as locals until `run` returns.
-        let loop_ = self.mainloop.loop_();
-        let ml = self.mainloop.clone();
-        let _sig_int = loop_.add_signal_local(pw::loop_::Signal::INT, move || ml.quit());
-        let ml = self.mainloop.clone();
-        let _sig_term = loop_.add_signal_local(pw::loop_::Signal::TERM, move || ml.quit());
-
-        let max_buffers = self.max_buffers;
         let inner = Inner {
-            pacing: pacing2,
+            pacing: self.pacing.clone(),
             negotiated: None,
-            max_buffers,
+            max_buffers: self.max_buffers,
             state_cb: self.state_cb,
             neg_cb: self.neg_cb,
             fill: Box::new(fill),
         };
 
+        // The driver timer and the SIGINT/SIGTERM sources must stay alive for
+        // the loop's duration: dropping a source destroys it (timer) or
+        // unregisters the handler (signal).
+        let _timer = driver_timer(&self.mainloop, &self.stream, self.pacing.clone());
+        let _quit_signals = quit_signals(&self.mainloop);
+
         // Keep the main loop alive until after the stream is dropped.
         let _mainloop = self.mainloop.clone();
-        let _listener = stream
+        let _listener = self
+            .stream
             .add_local_listener_with_user_data(inner)
-            .state_changed(
-                |stream: &pw::stream::Stream,
-                 inner: &mut Inner,
-                 _old,
-                 new: pw::stream::StreamState| {
-                    let node_id = stream.node_id();
-                    match new {
-                        pw::stream::StreamState::Unconnected
-                        | pw::stream::StreamState::Connecting => {
-                            inner.pacing.streaming.store(false, Ordering::SeqCst);
-                            (inner.state_cb)(State::Disconnected { error: None });
-                        }
-                        // A driver stream has a single link; the states
-                        // reflect the stream, not individual consumers.
-                        pw::stream::StreamState::Paused => {
-                            inner.pacing.streaming.store(false, Ordering::SeqCst);
-                            (inner.state_cb)(State::Paused { node_id });
-                        }
-                        pw::stream::StreamState::Streaming => {
-                            let driving = stream.is_driving();
-                            let lazy = unsafe { pw::sys::pw_stream_is_lazy(stream.as_raw_ptr()) };
-                            inner.pacing.next_due.store(now_ns(), Ordering::SeqCst);
-                            inner
-                                .pacing
-                                .streaming
-                                .store(driving && !lazy, Ordering::SeqCst);
-                            (inner.state_cb)(State::Streaming { node_id });
-                        }
-                        pw::stream::StreamState::Error(msg) => {
-                            inner.pacing.streaming.store(false, Ordering::SeqCst);
-                            println!("stream state: \"error\" {msg}");
-                            (inner.state_cb)(State::Disconnected { error: Some(msg) });
-                        }
-                    }
-                },
-            )
-            .param_changed(
-                |stream: &pw::stream::Stream,
-                 inner: &mut Inner,
-                 id: u32,
-                 param: Option<&pw::spa::pod::Pod>| {
-                    if id != ParamType::Format.as_raw() {
-                        return;
-                    }
-                    let Some(param) = param else { return };
-                    if param.type_().as_raw() != SpaTypes::Object.as_raw() {
-                        return;
-                    }
-                    let mut info = libspa::param::video::VideoInfoRaw::default();
-                    if info.parse(param).is_err() {
-                        eprintln!("pipewire-vircam: failed to parse negotiated Format");
-                        return;
-                    }
-                    let Some(format) = Format::from_spa_id(info.format().0) else {
-                        eprintln!(
-                            "pipewire-vircam: negotiated format {} is not supported",
-                            info.format().0
-                        );
-                        return;
-                    };
-                    let (stride, _h) = format.planes(info.size().width, info.size().height)[0];
-                    let neg = Negotiated {
-                        format,
-                        width: info.size().width,
-                        height: info.size().height,
-                        fps_num: info.framerate().num,
-                        fps_denom: info.framerate().denom,
-                        stride,
-                        node_id: stream.node_id(),
-                    };
-                    inner.pacing.period_ns.store(
-                        neg.fps_denom as u64 * 1_000_000_000 / neg.fps_num.max(1) as u64,
-                        Ordering::SeqCst,
-                    );
-                    inner.negotiated = Some(neg);
-                    (inner.neg_cb)(&neg);
-
-                    // Reply with ParamBuffers (and re-request the Header meta).
-                    let num_planes = neg.format.planes(neg.width, neg.height).len() as u32;
-                    let blobs: Vec<Vec<u8>> = vec![
-                        pod::meta_pod(),
-                        pod::buffers_pod(neg.stride, neg.height, num_planes, inner.max_buffers),
-                    ];
-                    let _ = pw_stream_update_params_ptr(stream.as_raw_ptr(), &blobs);
-                },
-            )
-            .process(|stream: &pw::stream::Stream, inner: &mut Inner| {
-                let Some(mut buf) = stream.dequeue_buffer() else {
-                    return;
-                };
-                // Snapshot the negotiation for this buffer. `negotiated`
-                // may be replaced by a later `param_changed` (renegotiation),
-                // so every field used below comes from this local copy.
-                let Some(neg) = inner.negotiated else {
-                    return; // not negotiated yet; buffer queued as-is
-                };
-                let datas = buf.datas_mut();
-                let layout = neg.format.planes(neg.width, neg.height);
-                // Build the Vec<Plane>. SAFETY: `datas` is `&mut [Data]` for
-                // the whole buffer; each `datas[i]` is a distinct `spa_data`
-                // whose `data` pointer points into its own (disjoint) buffer
-                // allocated by PipeWire for this plane. The buffer is alive
-                // for the duration of `process` and is not shared, so holding
-                // `&mut` slices into several planes at once is sound. We use
-                // raw pointers to get around the borrow checker's (correct,
-                // but overly conservative) rule that two `datas[i].method()`
-                // calls in one expression both borrow the whole slice.
-                let n = datas.len().min(layout.len());
-                let datas_ptr: *mut Data = datas.as_mut_ptr();
-                let mut planes: Vec<Plane> = Vec::with_capacity(n);
-                for (i, &(stride, height)) in layout.iter().take(n).enumerate() {
-                    // SAFETY: `datas_ptr.add(i)` is in-bounds (i < n <= len)
-                    // and each element is a disjoint `spa_data`.
-                    let d: &mut Data = unsafe { &mut *datas_ptr.add(i) };
-                    // Set the chunk for this plane (offset 0, full size). The
-                    // chunk borrow must end before we take the data borrow
-                    // (both are `&mut Data`), hence the inner scope.
-                    {
-                        let c = d.chunk_mut();
-                        *c.offset_mut() = 0;
-                        *c.size_mut() = stride * height;
-                        *c.stride_mut() = stride as i32;
-                    }
-                    // SAFETY: `d.data()`'s `&mut` is into this plane's buffer
-                    // (maxsize >= stride*height); the buffer outlives `process`.
-                    let Some(data) = d.data() else { return };
-                    planes.push(Plane {
-                        stride,
-                        height,
-                        data,
-                    });
-                }
-                let mut frame = Frame {
-                    width: neg.width,
-                    height: neg.height,
-                    format: neg.format,
-                    fps_num: neg.fps_num,
-                    fps_denom: neg.fps_denom,
-                    planes,
-                };
-                (inner.fill)(&mut frame, &neg);
-                // Dropping `buf` queues the buffer back to the stream.
-            })
+            .state_changed(on_state_changed)
+            .param_changed(on_param_changed)
+            .process(on_process)
             .register();
 
         self.mainloop.run();
         Ok(())
     }
+}
+
+/// Create the driver timer and arm it for a 1 ms period. The callback
+/// produces at most one frame per negotiated period (software pacing, so fps
+/// can change with renegotiation without re-arming). The caller must keep
+/// the returned source alive for the main loop's duration (drop destroys it).
+fn driver_timer<'l>(
+    mainloop: &'l pw::main_loop::MainLoopRc,
+    stream: &pw::stream::StreamRc,
+    pacing: Arc<Pacing>,
+) -> pw::loop_::TimerSource<'l> {
+    let stream = stream.clone();
+    let timer = mainloop.loop_().add_timer(move |_exps| {
+        if !pacing.streaming.load(Ordering::SeqCst) {
+            return;
+        }
+        let period = pacing.period_ns.load(Ordering::SeqCst);
+        if period == 0 {
+            return;
+        }
+        let now = now_ns();
+        let next = pacing.next_due.load(Ordering::SeqCst);
+        if now < next {
+            return;
+        }
+        // Advance past any missed periods (no catch-up bursts).
+        let missed = (now - next) / period;
+        pacing
+            .next_due
+            .store(next + (missed + 1) * period, Ordering::SeqCst);
+        let _ = stream.trigger_process();
+    });
+    let _ = timer.update_timer(
+        Some(Duration::from_millis(1)),
+        Some(Duration::from_millis(1)),
+    );
+    timer
+}
+
+/// Register SIGINT/SIGTERM as main-loop quit triggers (like the C reference).
+/// The returned sources must stay alive for the main loop's duration (drop
+/// unregisters the handler).
+fn quit_signals(
+    mainloop: &pw::main_loop::MainLoopRc,
+) -> (pw::loop_::SignalSource<'_>, pw::loop_::SignalSource<'_>) {
+    let loop_ = mainloop.loop_();
+    let ml = mainloop.clone();
+    let sig_int = loop_.add_signal_local(pw::loop_::Signal::INT, move || ml.quit());
+    let ml = mainloop.clone();
+    let sig_term = loop_.add_signal_local(pw::loop_::Signal::TERM, move || ml.quit());
+    (sig_int, sig_term)
+}
+
+/// `state_changed`: update the pacing flag and report [`State`] to the user.
+fn on_state_changed(
+    stream: &pw::stream::Stream,
+    inner: &mut Inner,
+    _old: pw::stream::StreamState,
+    new: pw::stream::StreamState,
+) {
+    let node_id = stream.node_id();
+    match new {
+        // A driver stream has a single link; the states reflect the stream,
+        // not individual consumers.
+        pw::stream::StreamState::Unconnected | pw::stream::StreamState::Connecting => {
+            inner.pacing.streaming.store(false, Ordering::SeqCst);
+            (inner.state_cb)(State::Disconnected { error: None });
+        }
+        pw::stream::StreamState::Paused => {
+            inner.pacing.streaming.store(false, Ordering::SeqCst);
+            (inner.state_cb)(State::Paused { node_id });
+        }
+        pw::stream::StreamState::Streaming => {
+            let driving = stream.is_driving();
+            let lazy = unsafe { pw::sys::pw_stream_is_lazy(stream.as_raw_ptr()) };
+            inner.pacing.next_due.store(now_ns(), Ordering::SeqCst);
+            inner
+                .pacing
+                .streaming
+                .store(driving && !lazy, Ordering::SeqCst);
+            (inner.state_cb)(State::Streaming { node_id });
+        }
+        pw::stream::StreamState::Error(msg) => {
+            inner.pacing.streaming.store(false, Ordering::SeqCst);
+            println!("stream state: \"error\" {msg}");
+            (inner.state_cb)(State::Disconnected { error: Some(msg) });
+        }
+    }
+}
+
+/// `param_changed`: parse the negotiated Format, snapshot it, update the
+/// driver period, and reply with `ParamBuffers` + a `meta` (Header) request.
+fn on_param_changed(
+    stream: &pw::stream::Stream,
+    inner: &mut Inner,
+    id: u32,
+    param: Option<&pw::spa::pod::Pod>,
+) {
+    if id != ParamType::Format.as_raw() {
+        return;
+    }
+    let Some(param) = param else { return };
+    if param.type_().as_raw() != SpaTypes::Object.as_raw() {
+        return;
+    }
+    let mut info = libspa::param::video::VideoInfoRaw::default();
+    if info.parse(param).is_err() {
+        eprintln!("pipewire-vircam: failed to parse negotiated Format");
+        return;
+    }
+    let Some(format) = Format::from_spa_id(info.format().0) else {
+        eprintln!(
+            "pipewire-vircam: negotiated format {} is not supported",
+            info.format().0
+        );
+        return;
+    };
+    let (stride, _h) = format.planes(info.size().width, info.size().height)[0];
+    let neg = Negotiated {
+        format,
+        width: info.size().width,
+        height: info.size().height,
+        fps_num: info.framerate().num,
+        fps_denom: info.framerate().denom,
+        stride,
+        node_id: stream.node_id(),
+    };
+    inner.pacing.period_ns.store(
+        neg.fps_denom as u64 * 1_000_000_000 / neg.fps_num.max(1) as u64,
+        Ordering::SeqCst,
+    );
+    inner.negotiated = Some(neg);
+    (inner.neg_cb)(&neg);
+
+    // Reply with ParamBuffers (and re-request the Header meta).
+    let num_planes = neg.format.planes(neg.width, neg.height).len() as u32;
+    let blobs: Vec<Vec<u8>> = vec![
+        pod::meta_pod(),
+        pod::buffers_pod(neg.stride, neg.height, num_planes, inner.max_buffers),
+    ];
+    let _ = pw_stream_update_params_ptr(stream.as_raw_ptr(), &blobs);
+}
+
+/// `process`: snapshot the negotiation for this buffer, hand a [`Frame`] to
+/// the fill handler, and return the buffer (dropping it re-queues it).
+fn on_process(stream: &pw::stream::Stream, inner: &mut Inner) {
+    let Some(mut buf) = stream.dequeue_buffer() else {
+        return;
+    };
+    // Snapshot the negotiation for this buffer. `negotiated`
+    // may be replaced by a later `param_changed` (renegotiation),
+    // so every field used below comes from this local copy.
+    let Some(neg) = inner.negotiated else {
+        return; // not negotiated yet; buffer queued as-is
+    };
+    let layout = neg.format.planes(neg.width, neg.height);
+    let Some(planes) = build_planes(buf.datas_mut(), &layout) else {
+        return;
+    };
+    let mut frame = Frame {
+        width: neg.width,
+        height: neg.height,
+        format: neg.format,
+        fps_num: neg.fps_num,
+        fps_denom: neg.fps_denom,
+        planes,
+    };
+    (inner.fill)(&mut frame, &neg);
+    // Dropping `buf` queues the buffer back to the stream.
+}
+
+/// Build the [`Frame`] plane views from the buffer's `datas` and the
+/// negotiated per-plane layout, and set each plane's chunk (offset 0, full
+/// size). Returns `None` if a plane has no data (the buffer is not usable).
+///
+/// SAFETY: `datas` is `&mut [Data]` for the whole buffer; each `datas[i]` is
+/// a distinct `spa_data` whose `data` pointer points into its own (disjoint)
+/// buffer allocated by PipeWire for this plane. The buffer is alive for the
+/// duration of the call and is not shared, so holding `&mut` slices into
+/// several planes at once is sound. We use raw pointers to get around the
+/// borrow checker's (correct, but overly conservative) rule that two
+/// `datas[i].method()` calls in one expression both borrow the whole slice.
+fn build_planes<'b>(datas: &'b mut [Data], layout: &[(u32, u32)]) -> Option<Vec<Plane<'b>>> {
+    let n = datas.len().min(layout.len());
+    let datas_ptr: *mut Data = datas.as_mut_ptr();
+    let mut planes: Vec<Plane> = Vec::with_capacity(n);
+    for (i, &(stride, height)) in layout.iter().take(n).enumerate() {
+        // SAFETY: `datas_ptr.add(i)` is in-bounds (i < n <= len) and each
+        // element is a disjoint `spa_data`.
+        let d: &mut Data = unsafe { &mut *datas_ptr.add(i) };
+        // Set the chunk for this plane (offset 0, full size). The
+        // chunk borrow must end before we take the data borrow (both are
+        // `&mut Data`), hence the inner scope.
+        {
+            let c = d.chunk_mut();
+            *c.offset_mut() = 0;
+            *c.size_mut() = stride * height;
+            *c.stride_mut() = stride as i32;
+        }
+        // SAFETY: `d.data()`'s `&mut` is into this plane's buffer
+        // (maxsize >= stride*height); the buffer outlives the caller.
+        let data = d.data()?;
+        planes.push(Plane {
+            stride,
+            height,
+            data,
+        });
+    }
+    Some(planes)
 }

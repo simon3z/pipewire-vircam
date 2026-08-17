@@ -16,22 +16,16 @@ use pipewire as pw;
 use pipewire::spa::{
     param::{
         format::{FormatProperties, MediaSubtype, MediaType},
-        video::VideoFormat,
         ParamType,
     },
     pod::{serialize::PodSerializer, Object, Pod, Property, PropertyFlags, Value},
     utils::{Choice, ChoiceEnum, Fraction, Rectangle, SpaTypes},
 };
 
-use crate::Format;
+use crate::{Config, Format};
 
 /// Hard ceiling on `Config::max_buffers` (keeps the SPA range sane).
 pub const MAX_BUFFERS: i32 = 16;
-
-fn video_format(f: Format) -> VideoFormat {
-    f.video_format()
-        .expect("Format always maps to a VideoFormat")
-}
 
 /// One `EnumFormat` Format object with plain (fixed) values for a single
 /// (format, size, fps) combination.
@@ -41,7 +35,7 @@ pub fn enumformat_pod(format: Format, width: u32, height: u32, fps: u32) -> Vec<
         ParamType::EnumFormat,
         pw::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
         pw::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-        pw::spa::pod::property!(FormatProperties::VideoFormat, Id, video_format(format)),
+        pw::spa::pod::property!(FormatProperties::VideoFormat, Id, format.video_format()),
         pw::spa::pod::property!(
             FormatProperties::VideoSize,
             Rectangle,
@@ -123,6 +117,30 @@ pub fn meta_pod() -> Vec<u8> {
     serialize(obj)
 }
 
+/// The `EnumFormat` blobs to advertise for `config`: one plain-values Format
+/// object per unique (format, size, fps) combination, followed by a `meta`
+/// (Header) request.
+pub fn advertised_param_blobs(config: &Config) -> Vec<Vec<u8>> {
+    // Deduplicate (format, size, fps) combinations before advertising.
+    let mut advertised: Vec<(Format, u32, u32, u32)> = Vec::new();
+    for mode in &config.modes {
+        for &fps in &mode.fps {
+            for &format in &mode.formats {
+                let entry = (format, mode.width, mode.height, fps);
+                if !advertised.contains(&entry) {
+                    advertised.push(entry);
+                }
+            }
+        }
+    }
+    let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(advertised.len() + 1);
+    for &(format, width, height, fps) in &advertised {
+        blobs.push(enumformat_pod(format, width, height, fps));
+    }
+    blobs.push(meta_pod());
+    blobs
+}
+
 /// Serialize a POD `Object` into an owned blob. The blob is parsed back
 /// before it leaves this module, so a serialization regression panics here
 /// rather than deep in PipeWire.
@@ -139,6 +157,7 @@ pub fn serialize(obj: Object) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Mode;
     use libspa::param::video::VideoInfoRaw;
 
     /// A distinctive geometry: width != height != fps, so a size/framerate
@@ -160,7 +179,7 @@ mod tests {
                 .expect("EnumFormat must parse as a video format");
             assert_eq!(
                 info.format(),
-                video_format(*f),
+                f.video_format(),
                 "format id mismatch for {f:?}"
             );
             assert_eq!(info.size().width, W);
@@ -185,6 +204,37 @@ mod tests {
             assert_eq!(info.size().width, W);
             assert_eq!(info.size().height, H);
         }
+    }
+
+    /// Duplicate (format, size, fps) combinations are advertised once, and
+    /// the advertised blobs end with the `meta` (Header) request.
+    #[test]
+    fn advertised_param_blobs_dedup() {
+        let config = Config {
+            name: "cam".into(),
+            media_name: "cam".into(),
+            modes: vec![
+                Mode {
+                    width: W,
+                    height: H,
+                    fps: vec![FPS, FPS],
+                    formats: vec![Format::Rgba, Format::Rgba],
+                },
+                Mode {
+                    width: W,
+                    height: H,
+                    fps: vec![FPS + 1],
+                    formats: vec![Format::Rgba],
+                },
+            ],
+            max_buffers: 4,
+        };
+        let blobs = advertised_param_blobs(&config);
+        // (Rgba, WxH, FPS) twice -> 1, (Rgba, WxH, FPS + 1) -> 1, plus meta.
+        assert_eq!(blobs.len(), 3);
+        let meta = Pod::from_bytes(&blobs[2]).expect("meta pod must parse");
+        let obj = meta.as_object().expect("meta pod must be an object");
+        assert_eq!(obj.id().0, ParamType::Meta.as_raw());
     }
 
     /// `buffers_pod` and `meta_pod` serialize to well-formed (parseable)

@@ -8,7 +8,7 @@ consumer connects.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust edition: 2021](https://img.shields.io/badge/rust-2021-orange.svg)](https://doc.rust-lang.org/edition-guide)
-[![Tests: 52 checks](https://img.shields.io/badge/tests-52%20checks-brightgreen.svg)](ci.sh)
+[![Tests: 47 checks](https://img.shields.io/badge/tests-47%20checks-brightgreen.svg)](e2e.sh)
 
 <!--
   Once hosted on GitHub with a CI workflow, replace the static test badge with:
@@ -51,7 +51,7 @@ reference/    standalone C (not part of the crate) — built to repo root
   redcam-test.c   the independent capture consumer + oracle (`redcam-test`)
 ci.sh           CI quality gate (fmt, clippy, package, test, arborist)
 e2e.sh          E2E harness (needs live PipeWire session)
-Makefile        `make`, `make test`, `make clean`
+Makefile        `make`, `make test`, `make e2e`, `make clean`
 ```
 
 ### The red-cam trio
@@ -130,9 +130,9 @@ Leave it running and any PipeWire-aware consumer can select it.
 redcam [--name NAME] [--mode WxH@FPS]...
 ```
 
-`--mode` is repeatable. Default is a single `1920x1080@30` mode with formats
-RGBA/BGRA/BGR/RGB. (Formats are per-mode in `Config`; the demo binary uses a
-fixed set for parsed modes.)
+`--mode` is repeatable. The default is a single `1920x1080@30` mode offering
+every supported format. (Formats are per-mode in `Config`; parsed `--mode`
+values get the full supported set.)
 
 ## Using the `pipewire-vircam` crate
 
@@ -140,9 +140,9 @@ The minimal example lives in [`examples/mycam.rs`](examples/mycam.rs) (built
 by `cargo build --examples`). In brief:
 
 ```rust
-use pipewire_vircam::{Camera, Config, Format, Mode};
+use pipewire_vircam::{Camera, Config, Format, Mode, Negotiated};
 
-fn fill(frame: &mut pipewire_vircam::Frame) {
+fn fill(frame: &mut pipewire_vircam::Frame, _negotiated: &Negotiated) {
     // `frame` is self-describing: the negotiated format/size plus one plane
     // per buffer. Packed formats have one plane; planar YUV has several
     // (Y, then U/V or interleaved UV). Fill every plane.
@@ -155,22 +155,25 @@ fn fill(frame: &mut pipewire_vircam::Frame) {
 
 // `Camera::new` creates the node and does NOT block. `.run(fill)` installs
 // the driver timer and blocks until SIGINT/SIGTERM.
-let _ = Camera::new(Config {
+let cam = Camera::new(Config {
     name: "mycam".into(),
     media_name: "My Camera".into(),
-    modes: vec![Mode { width: 1920, height: 1080, fps: 30, formats: vec![Format::Rgba] }],
-})?
-.run(fill);
+    modes: vec![Mode { width: 1920, height: 1080, fps: vec![30], formats: vec![Format::Rgba] }],
+    max_buffers: 4,
+})?;
+cam.run(fill)?;
 ```
 
 - `Camera::new` creates the node and does **not** block.
 - `.on_state(...)` / `.on_negotiated(...)` are optional builders; `.run(fill)`
   blocks until SIGINT/SIGTERM.
-- The `fill` closure is called on the main-loop thread, at the negotiated fps,
-  only while a consumer is connected and streaming. `Frame` is self-describing,
-  so your code adapts to whatever the consumer negotiated.
-- `State` reports `Disconnected` / `Paused{node_id}` / `Streaming{node_id}`;
-  `Negotiated` carries `format`, `width`, `height`, `fps_num/denom`, `stride`.
+- The `fill` closure takes `(&mut Frame, &Negotiated)` and is called on the
+  main-loop thread, at the negotiated fps, only while a consumer is connected
+  and streaming. `Frame` is self-describing, so your code adapts to whatever
+  the consumer negotiated.
+- `State` reports `Disconnected { error }` / `Paused { node_id }` /
+  `Streaming { node_id }`; `Negotiated` carries `format`, `width`, `height`,
+  `fps_num/denom` (plus `fps()`), `stride`, `node_id`.
 
 ## How to consume `redcam`
 
@@ -195,36 +198,45 @@ Pick the node and open an input stream on it. Three concrete ways:
 3. **Any PipeWire-aware app** (e.g. OBS, a camera selector in your media
    stack) will see "Red Virtual Camera" as a capture device.
 
-## Self-evaluation (`make test`)
+## Self-evaluation (`make e2e`)
 
-`make test` runs `ci.sh`, which for **two independent sequences**
-builds, starts the **Rust** camera, and checks:
+`make e2e` runs `e2e.sh`, which builds the **Rust** camera and the C oracle,
+then for **three sequences** (two identical full 1080p sequences, plus a
+multi-size/multi-fps sequence) starts the camera and checks:
 
 1. **Registration** — the node is in `pw-cli` with `MediaClass "Video/Source"`
    and `MediaName "Red Virtual Camera"`.
-2. **Session manager** — the node is visible in `wpctl status` (Video tree).
+2. **Session manager** — the node is visible in `wpctl status` (Video tree)
+   (full sequences).
 3. **Core assertion** — `redcam-test` (the independent C oracle) captures 30
-   frames and proves every pixel is red, size is 1920×1080, and fps is within
-   [24, 40].
+   frames per check and proves every pixel is red, the size is exact, and fps
+   is within [24, 40] of the requested rate — for each of the 12 formats
+   (full sequences) and for six size/fps/format combinations
+   (1920×1080@30, 1280×720@60, 640×480@15).
 4. **Real-app integration** — a GStreamer `pipewiresrc → videoconvert →
    pngenc` pipeline captures a frame from the node; the PNG is verified to be
-   1920×1080 and red (via ImageMagick).
+   1920×1080 and red (via ImageMagick) (full sequences).
 5. **Clean teardown** — killing redcam removes the node; no error lines in the
    redcam log.
 
-Exit code is 0 only if *all* checks pass on *both* sequences. Every long-running
-process (redcam, consumers, gst pipelines) is backgrounded and always killed.
+Exit code is 0 only if *all* 47 checks pass on *all* sequences. Every
+long-running process (redcam, consumers, gst pipelines) is backgrounded and
+always killed. It needs a live PipeWire/WirePlumber session.
+
+`make test` runs `ci.sh`, the lean quality gate: `cargo fmt`, `clippy`,
+`package`, `test` (unit tests + timing benchmarks) and an arborist complexity
+check. No live session needed.
 
 To test the C reference producer instead of the Rust one:
-`RED_BIN=redcam-c make test` (after `make redcam-c`).
+`RED_BIN=redcam-c make e2e` (after `make redcam-c`).
 
 ### What the oracle asserts
 
 | Check | Proves |
 |-------|--------|
-| `size_ok` | negotiated size is exactly 1920×1080 (not a stretched/undersized frame) |
+| `size_ok` | negotiated size is exactly the requested size (default 1920×1080) |
 | `red_ok` | **every** pixel of **every** frame is solid red for the negotiated format |
-| `fps` | frames arrive at ≈30 fps (timer is driving, not a one-shot) |
+| `fps` | frames arrive at ≈the requested fps (timer is driving, not a one-shot) |
 | `frames` | N distinct frames were received |
 | `seq_ok` | (best-effort) per-frame sequence advanced — only when the Header meta is negotiated |
 
@@ -243,9 +255,10 @@ approach.
 
 ## Design notes
 
-- **Official `pipewire` 0.10 crate**, safe API throughout except two narrow
-  `sys` calls (`pw_stream_connect`, `pw_stream_update_params`) whose `&mut
-  [&Pod]` argument can't be built from owned PODs in this crate version.
+- **Official `pipewire` 0.10 crate**, safe API throughout except three narrow
+  `sys` calls (`pw_stream_connect`, `pw_stream_update_params`, whose `&mut
+  [&Pod]` arguments can't be built from owned PODs in this crate version, and
+  `pw_stream_is_lazy`, which has no safe wrapper).
 - **`pw_stream`** API (as in upstream `video-src.c` / `video-play.c`), not a
   raw SPA node export — it handles buffer allocation and negotiation plumbing.
 - **Fixed spec, all uncompressed formats.** The demo advertises 1920×1080@30
@@ -274,16 +287,17 @@ approach.
 ## Development
 
 ```sh
-make test          # the full harness (Rust redcam + C oracle)
+make test          # lean CI gate (fmt, clippy, package, test, arborist)
+make e2e           # the E2E harness (Rust redcam + C oracle; live PipeWire)
 make redcam-c      # C reference producer
 make clean && make # rebuild
-./ci.sh            # CI gate (fmt, clippy, package, test, arborist)
-./e2e.sh           # E2E harness (needs live PipeWire session)
+./ci.sh            # same as make test
+./e2e.sh           # same as make e2e
 ```
 
 See the "Key decisions" / design sections above for how it works; the
-source files are self-documenting, and the harness (`ci.sh`) plus
-`make test` are the source of truth for what "works."
+source files are self-documenting, and the E2E harness (`e2e.sh`) is the
+source of truth for what "works."
 
 ## License
 
