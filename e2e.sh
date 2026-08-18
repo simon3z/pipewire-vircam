@@ -60,9 +60,12 @@ stop_producer() {
 }
 
 assert_registered() {
-    local seq=$1
-    if pw-cli ls 2>/dev/null | grep -q 'node.name = "redcam"' \
-        && pw-cli ls 2>/dev/null | grep -q 'media.class = "Video/Source"'; then
+    local seq=$1 listing
+    # Snapshot once: grepping a live pw-cli can SIGPIPE it mid-stream, and
+    # both properties must come from the *same* node block anyway.
+    listing=$(pw-cli ls 2>/dev/null)
+    if printf '%s\n' "$listing" | grep -A 30 'node.name = "redcam"' \
+        | grep -q 'media.class = "Video/Source"'; then
         ok "sequence $seq: node registered (node.name=redcam, media.class=Video/Source)"
     else
         fail "sequence $seq: node registration (pw-cli)"

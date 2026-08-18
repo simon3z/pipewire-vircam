@@ -481,7 +481,6 @@ fn on_state_changed(
         }
         pw::stream::StreamState::Error(msg) => {
             inner.pacing.streaming.store(false, Ordering::SeqCst);
-            println!("stream state: \"error\" {msg}");
             (inner.state_cb)(State::Disconnected { error: Some(msg) });
         }
     }
@@ -513,14 +512,9 @@ fn on_param_changed(
     }
     let mut info = libspa::param::video::VideoInfoRaw::default();
     if info.parse(param).is_err() {
-        eprintln!("pipewire-vircam: failed to parse negotiated Format");
         return;
     }
     let Some(format) = Format::from_spa_id(info.format().0) else {
-        eprintln!(
-            "pipewire-vircam: negotiated format {} is not supported",
-            info.format().0
-        );
         return;
     };
     let (stride, _h) = format.planes(info.size().width, info.size().height)[0];
@@ -545,12 +539,8 @@ fn on_param_changed(
     // pulling. If the user returns `Err`, we do NOT reply with
     // `ParamBuffers`, so the consumer knows we rejected the geometry and
     // will either pick a different one or give up.
-    match (inner.neg_cb_accept)(&neg) {
-        Ok(()) => {}
-        Err(msg) => {
-            eprintln!("pipewire-vircam: rejecting negotiated format: {msg}");
-            return;
-        }
+    if (inner.neg_cb_accept)(&neg).is_err() {
+        return;
     }
     (inner.neg_cb)(&neg);
     reply_buffers(stream, neg, inner.max_buffers);

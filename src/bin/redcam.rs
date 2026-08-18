@@ -166,7 +166,6 @@ fn main() {
 
     if let Err(e) = cam
         .on_state(|st: State| match st {
-            // The crate already logs `stream state: "error" <msg>` for errors.
             State::Disconnected { error: Some(_) } => {}
             State::Disconnected { error: None } => println!("stream state: \"unconnected\""),
             State::Paused { node_id } => {
