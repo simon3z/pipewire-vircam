@@ -33,6 +33,7 @@ pub const MAX_BUFFERS: i32 = 16;
 /// helpers the v4l2 node uses wrap those same ints. `pw-topology`'s
 /// `video.c` decodes them back to `"16-235"`, `"bt601"`, `"bt709"`, ... by
 /// value.
+const COLOR_RANGE_0_255: u32 = pw::spa::sys::SPA_VIDEO_COLOR_RANGE_0_255;
 const COLOR_RANGE_16_235: u32 = pw::spa::sys::SPA_VIDEO_COLOR_RANGE_16_235;
 const COLOR_MATRIX_BT601: u32 = pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT601;
 const COLOR_MATRIX_BT709: u32 = pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT709;
@@ -52,10 +53,18 @@ pub type FpsChoice = (u32, u32);
 /// fractions — the "multiple fps choices" shape `pw-topology` shows as
 /// `default: 10/1, alt1: ...`.
 pub fn enumformat_pod(format: Format, width: u32, height: u32, fps: &[FpsChoice]) -> Vec<u8> {
-    let (range, matrix) = if height <= 480 {
-        (COLOR_RANGE_16_235, COLOR_MATRIX_BT601)
+    // YUY2/UYVY are full range (0-255) like webcam YUYV422.
+    // NV12/NV21/I420 are limited range (16-235) like H.264 codecs.
+    // RGB formats don't use color range (it's meaningless for RGB).
+    let range = match format {
+        Format::Yuy2 | Format::Uvyvy => COLOR_RANGE_0_255,
+        Format::Nv12 | Format::Nv21 | Format::I420 => COLOR_RANGE_16_235,
+        _ => COLOR_RANGE_0_255, // RGB: default to full range (ignored by decoders)
+    };
+    let matrix = if height <= 480 {
+        COLOR_MATRIX_BT601
     } else {
-        (COLOR_RANGE_16_235, COLOR_MATRIX_BT709)
+        COLOR_MATRIX_BT709
     };
     // Build the framerate choice (enum): default = first, alternatives = rest.
     let framerate = if fps.len() == 1 {
