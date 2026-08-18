@@ -122,10 +122,14 @@ pub fn meta_pod() -> Vec<u8> {
 /// (Header) request.
 pub fn advertised_param_blobs(config: &Config) -> Vec<Vec<u8>> {
     // Deduplicate (format, size, fps) combinations before advertising.
+    // Loop order: FORMAT outer, FPS inner, so entries with the same
+    // (size, format) are *consecutive* — this lets OBS group them into a
+    // single "size + format" row with an fps sub-list, instead of showing
+    // each fps as a separate row.
     let mut advertised: Vec<(Format, u32, u32, u32)> = Vec::new();
     for mode in &config.modes {
-        for &fps in &mode.fps {
-            for &format in &mode.formats {
+        for &format in &mode.formats {
+            for &fps in &mode.fps {
                 let entry = (format, mode.width, mode.height, fps);
                 if !advertised.contains(&entry) {
                     advertised.push(entry);
@@ -235,6 +239,79 @@ mod tests {
         let meta = Pod::from_bytes(&blobs[2]).expect("meta pod must parse");
         let obj = meta.as_object().expect("meta pod must be an object");
         assert_eq!(obj.id().0, ParamType::Meta.as_raw());
+    }
+
+    /// Grouping invariant: for each (format, size), all fps entries must be
+    /// *consecutive* in the advertised blob list. This is what lets OBS group
+    /// them into one "size + format" row with an fps sub-list, instead of
+    /// showing each fps as a separate row. If the loop order in
+    /// `advertised_param_blobs` regresses (e.g. fps outer, format inner),
+    /// this test fails.
+    #[test]
+    fn advertised_param_blobs_grouped_by_format_then_size() {
+        // Two sizes, two formats, three fps each — enough to catch an
+        // interspersed ordering.
+        let config = Config {
+            name: "cam".into(),
+            media_name: "cam".into(),
+            modes: vec![
+                Mode {
+                    width: 1920,
+                    height: 1080,
+                    fps: vec![24, 30],
+                    formats: vec![Format::Rgba, Format::Nv12],
+                },
+                Mode {
+                    width: 1280,
+                    height: 720,
+                    fps: vec![24, 30],
+                    formats: vec![Format::Rgba, Format::Nv12],
+                },
+            ],
+            max_buffers: 4,
+        };
+        let blobs = advertised_param_blobs(&config);
+        // Parse each blob back to (format_id, width, height, fps).
+        let mut seen: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for blob in &blobs {
+            let pod = Pod::from_bytes(blob).expect("blob must parse");
+            let obj = pod.as_object().expect("must be an object");
+            // The meta pod (last) has ParamType::Meta, not EnumFormat — skip.
+            if obj.id().0 != ParamType::EnumFormat.as_raw() {
+                continue;
+            }
+            let mut info = VideoInfoRaw::default();
+            info.parse(pod).expect("must parse as video format");
+            seen.push((
+                info.format().0,
+                info.size().width,
+                info.size().height,
+                info.framerate().num,
+            ));
+        }
+        // Core invariant: each (format, size) group must be a *contiguous
+        // run* — no other (format, size) may appear after a group has
+        // started and then reappear later.
+        let mut groups_in_order: Vec<(u32, u32, u32)> = Vec::new();
+        for (fmt, w, h, _) in &seen {
+            let group = (*fmt, *w, *h);
+            match groups_in_order.iter().position(|g| *g == group) {
+                // First time seeing this group, or the immediately previous
+                // entry's group (contiguous) — OK.
+                Some(pos) => {
+                    if pos != groups_in_order.len() - 1 {
+                        // This group was seen before but NOT as the most
+                        // recent group — it was split.
+                        panic!(
+                            "group ({fmt}, {w}x{h}) is not contiguous — fps
+                            for a (format, size) must be advertised
+                            consecutively"
+                        );
+                    }
+                }
+                None => groups_in_order.push(group),
+            }
+        }
     }
 
     /// `buffers_pod` and `meta_pod` serialize to well-formed (parseable)
