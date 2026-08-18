@@ -137,6 +137,17 @@ fn now_ns() -> u64 {
     start.elapsed().as_nanos() as u64
 }
 
+/// "Accept" callback: called *before* we reply with `ParamBuffers`.
+/// The user is expected to set up their backend here (synchronously), so the
+/// first frame is ready before the consumer starts pulling.
+/// Returning `Err` rejects the geometry (no reply sent).
+type NegotiateAcceptCb = Box<dyn FnMut(&Negotiated) -> Result<(), String>>;
+/// "Negotiated" callback: called *after* we have accepted the geometry
+/// (i.e. after the `ParamBuffers` reply is queued). Purely informational.
+type NegotiatedCb = Box<dyn FnMut(&Negotiated)>;
+/// Frame-fill callback: called per frame to fill the buffer.
+type FillCb = Box<dyn FnMut(&mut Frame, &Negotiated)>;
+
 /// Listener user data: what the stream callbacks share.
 struct Inner {
     pacing: Arc<Pacing>,
@@ -145,9 +156,9 @@ struct Inner {
     negotiated: Option<Negotiated>,
     max_buffers: u32,
     state_cb: Box<dyn FnMut(State)>,
-    neg_cb: Box<dyn FnMut(&Negotiated)>,
-    #[allow(clippy::type_complexity)]
-    fill: Box<dyn FnMut(&mut Frame, &Negotiated)>,
+    neg_cb_accept: NegotiateAcceptCb,
+    neg_cb: NegotiatedCb,
+    fill: FillCb,
 }
 
 /// A PipeWire virtual camera: create it, register callbacks, run it.
@@ -157,7 +168,8 @@ pub struct Camera {
     pacing: Arc<Pacing>,
     max_buffers: u32,
     state_cb: Box<dyn FnMut(State)>,
-    neg_cb: Box<dyn FnMut(&Negotiated)>,
+    neg_cb_accept: NegotiateAcceptCb,
+    neg_cb: NegotiatedCb,
 }
 
 /// A handle to signal the main loop to quit, usable from any callback
@@ -205,14 +217,13 @@ fn validate(config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
-/// Reinterpret owned POD blobs as `&mut [Pod]` for the safe wrappers.
+/// Call `pw_stream_update_params` with owned POD blobs. The safe wrapper's
+/// `&mut [&Pod]` argument cannot be built from owned PODs in pipewire 0.10, so
+/// we pass a pointer array to the C function instead.
+///
 /// SAFETY: each blob is a well-formed serialized POD (built and round-trip
-/// parsed in [`pod::serialize`]) that outlives the call, so the reinterpreted
-/// `Pod`s are valid for the duration of the FFI call. The blobs are disjoint,
-/// so the mutable references do not alias.
-/// `pw_stream_update_params` with owned POD blobs (the safe wrapper's
-/// `&mut [&Pod]` argument cannot be built from owned PODs in pipewire 0.10).
-/// SAFETY: the blobs are well-formed serialized PODs that outlive the call.
+/// parsed in [`pod::serialize`]) and outlives the call, so the borrowed
+/// pointer array is valid for the duration of the FFI call.
 fn pw_stream_update_params_ptr(stream: *mut pw::sys::pw_stream, blobs: &[Vec<u8>]) -> i32 {
     let mut ptrs: Vec<*const pw::spa::sys::spa_pod> =
         blobs.iter().map(|b| b.as_ptr() as *const _).collect();
@@ -282,6 +293,7 @@ impl Camera {
                 next_due: AtomicU64::new(0),
             }),
             state_cb: Box::new(|_| {}),
+            neg_cb_accept: Box::new(|_| Ok(())),
             neg_cb: Box::new(|_| {}),
         })
     }
@@ -313,8 +325,28 @@ impl Camera {
     /// consumer picks a (format, size, fps) combination. It is guaranteed
     /// to be called at least once before the first `fill` call for a given
     /// consumer session. Default: no-op.
+    ///
+    /// If you need to *reject* a geometry (e.g. you cannot set up your
+    /// backend at that size), use [`on_negotiate_accept`](Self::on_negotiate_accept)
+    /// and return `Err` from there — the camera will then not reply with
+    /// `ParamBuffers`, and the consumer will pick a different (format, size,
+    /// fps) or give up.
     pub fn on_negotiated(mut self, cb: impl FnMut(&Negotiated) + 'static) -> Self {
         self.neg_cb = Box::new(cb);
+        self
+    }
+
+    /// Register an *accept* callback: called *before* the camera replies with
+    /// `ParamBuffers` to a consumer's Format request. The user is expected to
+    /// set up their backend here (synchronously) so that the first frame is
+    /// ready by the time the consumer starts pulling. Returning `Err` rejects
+    /// the geometry (no reply is sent), and the consumer will pick a different
+    /// (format, size, fps) or give up. Default: always accept.
+    pub fn on_negotiate_accept(
+        mut self,
+        cb: impl FnMut(&Negotiated) -> Result<(), String> + 'static,
+    ) -> Self {
+        self.neg_cb_accept = Box::new(cb);
         self
     }
 
@@ -341,6 +373,7 @@ impl Camera {
             negotiated: None,
             max_buffers: self.max_buffers,
             state_cb: self.state_cb,
+            neg_cb_accept: self.neg_cb_accept,
             neg_cb: self.neg_cb,
             fill: Box::new(fill),
         };
@@ -456,6 +489,15 @@ fn on_state_changed(
 
 /// `param_changed`: parse the negotiated Format, snapshot it, update the
 /// driver period, and reply with `ParamBuffers` + a `meta` (Header) request.
+///
+/// **The reply is the acknowledgement.** PipeWire will not enter `Streaming`
+/// until the source has replied with params that are compatible with what
+/// the consumer asked for. If the user's `on_negotiate_accept` callback
+/// returns an `Err`, we reply with *nothing* (no `ParamBuffers`), which tells the
+/// consumer "I cannot honour this request" and lets it pick a different
+/// (format, size, fps) or give up. This is what lets the user set up their
+/// backend *before* the camera commits to a geometry, so the first frame is
+/// ready by the time the consumer starts pulling.
 fn on_param_changed(
     stream: &pw::stream::Stream,
     inner: &mut Inner,
@@ -496,13 +538,37 @@ fn on_param_changed(
         Ordering::SeqCst,
     );
     inner.negotiated = Some(neg);
-    (inner.neg_cb)(&neg);
 
-    // Reply with ParamBuffers (and re-request the Header meta).
+    // Ask the user whether we can honour this request. The user is
+    // responsible for setting up their backend here (synchronously) so
+    // that the first frame is ready by the time the consumer starts
+    // pulling. If the user returns `Err`, we do NOT reply with
+    // `ParamBuffers`, so the consumer knows we rejected the geometry and
+    // will either pick a different one or give up.
+    match (inner.neg_cb_accept)(&neg) {
+        Ok(()) => {}
+        Err(msg) => {
+            eprintln!("pipewire-vircam: rejecting negotiated format: {msg}");
+            return;
+        }
+    }
+    (inner.neg_cb)(&neg);
+    reply_buffers(stream, neg, inner.max_buffers);
+}
+
+/// Reply with `ParamBuffers` (and re-request the Header meta) — the
+/// acknowledgement that we accepted the consumer's (format, size, fps).
+///
+/// `blocks` is the number of data blocks (planes) per buffer; `size` is the
+/// size of the *first* block (`stride × height`), and the stride of the first
+/// block. PipeWire derives the per-plane layout from the negotiated video
+/// format, so we only need to describe the primary block here (matching
+/// upstream `video-src.c` and the `redcam-test` oracle).
+fn reply_buffers(stream: &pw::stream::Stream, neg: Negotiated, max_buffers: u32) {
     let num_planes = neg.format.planes(neg.width, neg.height).len() as u32;
     let blobs: Vec<Vec<u8>> = vec![
         pod::meta_pod(),
-        pod::buffers_pod(neg.stride, neg.height, num_planes, inner.max_buffers),
+        pod::buffers_pod(neg.stride, neg.height, num_planes, max_buffers),
     ];
     let _ = pw_stream_update_params_ptr(stream.as_raw_ptr(), &blobs);
 }
