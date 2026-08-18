@@ -2,6 +2,21 @@
 
 All notable changes to this crate, per release.
 
+## 0.3.0
+
+- Added `Camera::on_negotiate_accept`: an accept callback invoked before the
+  camera replies with `ParamBuffers`; returning `Err` rejects the negotiated
+  geometry (no reply is sent), so the user can set up their backend before the
+  consumer starts pulling.
+- **Breaking:** `Error` no longer carries the `Stream`, `UnsupportedFormat`,
+  and `PipeWire` variants (they were never produced); runtime stream errors
+  are reported via `State::Disconnected { error: Some(..) }`, and an
+  unsupported negotiated format is handled by not replying with `ParamBuffers`.
+  `Error` is now just `InvalidConfig` / `Connect`.
+- The advertised `EnumFormat` entries are now ordered (format, size) outer / fps
+  inner, so all framerates for a (size, format) are consecutive; consumers like
+  OBS can group them into one row with an fps sub-list.
+
 ## 0.2.0
 
 - **Breaking:** `Mode::fps` is now `Vec<u32>` (was `u32`), so a single size can

@@ -1,6 +1,6 @@
 [package]
 name = "pipewire-vircam"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Create a PipeWire virtual camera from Rust: register a camera node and fill its frames from your own code"
 license = "Apache-2.0"
