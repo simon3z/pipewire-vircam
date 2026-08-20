@@ -46,9 +46,8 @@
 //!
 //! Construction failures (bad config, PipeWire connect failure) return
 //! [`Error`]. A runtime stream error (e.g. the link dies) is reported as
-//! [`State::Disconnected { error: Some(msg) }`] and logged to stdout as
-//! `stream state: "error" <msg>`; the camera stays up and a new consumer can
-//! reconnect.
+//! [`State::Disconnected { error: Some(msg) }`]; the camera stays up and a
+//! new consumer can reconnect.
 
 mod camera;
 mod error;

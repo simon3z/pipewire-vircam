@@ -2,6 +2,27 @@
 
 All notable changes to this crate, per release.
 
+## 0.4.0
+
+- The advertised `EnumFormat` entries now carry the colorimetry properties a
+  regular PipeWire camera node advertises (`colorRange`, `colorMatrix`,
+  `transferFunction`, `colorPrimaries`): BT.709 matrix/transfer/primaries,
+  with BT.601 matrix for heights ≤ 480 (matching the v4l2 node's
+  `V4L2_COLORSPACE_REC709` convention), and per-format color range —
+  full range (0-255) for YUY2/UYVY like webcam YUYV422, limited range
+  (16-235) for NV12/NV21/I420 like H.264 codecs.
+- The advertised `EnumFormat` entries are now one per unique (format, size)
+  combination, with the mode's framerates as a framerate `Choice` (enum) when
+  several fps are advertised — matching what upstream v4l2 nodes advertise
+  and how `pw-topology` renders `default: N/1, alt1: ...`. Single-fps entries
+  keep a plain `Fraction`.
+- Internal: the library no longer prints debug lines to stdout (error state
+  is still propagated via `State` callbacks); color constants now come from
+  the `libspa` sys bindings instead of hardcoded values (this also fixed
+  `SPA_VIDEO_TRANSFER_BT709`, which is 5, not 6).
+- The demo's `redcam` binary no longer prints per-frame negotiation lines;
+  it still prints node id and stream state.
+
 ## 0.3.0
 
 - Added `Camera::on_negotiate_accept`: an accept callback invoked before the

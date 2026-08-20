@@ -267,11 +267,14 @@ approach.
   produce exactly. For YUV, "red" is filled as the BT.709 limited-range
   equivalent (Y=63, Cb=104, Cr=240); MJPG and 10/16-bit formats are excluded
   (they need an encoder or aren't raw).
-- **`EnumFormat` values are *plain*, not choices.** The size is a plain
-  `Rectangle` (not `CHOICE_RANGE`) and the framerate a plain `Fraction`.
-  Apps like OBS parse the size with a plain-rectangle parse and silently
-  drop entries whose size/framerate are choice values — that was the cause of
-  OBS showing empty format/resolution/framerate dropdowns.
+- **`EnumFormat` size is *plain*; framerate may be a `Choice`.** The size is a
+  plain `Rectangle` (not `CHOICE_RANGE`) — apps like OBS parse the size with a
+  plain-rectangle parse and silently drop entries whose size is a choice
+  value, which was the cause of OBS showing empty format/resolution dropdowns.
+  Framerate is a plain `Fraction` for one fps per entry, or an enum `Choice`
+  (default + alternatives) when a mode advertises several fps for the same
+  (format, size); `pw-topology` renders that as `default: 30/1, alt1: 60/1`,
+  and OBS groups consecutive entries into one row with an fps sub-list.
 - **Source is the DRIVER**; a 1 ms timer produces at most one frame per
   negotiated period (software pacing, so fps survives renegotiation without
   re-arming). The consumer is passive.
