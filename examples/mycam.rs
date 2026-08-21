@@ -9,6 +9,10 @@ use pipewire_vircam::{Camera, Config, Format, Mode, State};
 /// Fill one frame. `frame` is self-describing: it carries the negotiated
 /// format/size and a plane per buffer. For a packed format there is exactly
 /// one plane; for planar YUV there are several (fill each).
+///
+/// `frame.seq` counts produced frames (from 0); `frame.pts` is the
+/// presentation timestamp (nanoseconds since the camera started, monotonic).
+/// Stamp your backend capture at `pts` if you render asynchronously.
 fn fill(frame: &mut pipewire_vircam::Frame, _negotiated: &pipewire_vircam::Negotiated) {
     // Example: clear every byte of every plane. Real apps write their own
     // pixels here, using frame.format to know the layout and

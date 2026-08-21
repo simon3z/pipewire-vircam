@@ -2,6 +2,31 @@
 
 All notable changes to this crate, per release.
 
+## 0.6.0
+
+- `Frame` now exposes timing: `seq` (a per-camera frame counter, starting at
+  0 and advancing by one per produced frame) and `pts` (presentation
+  timestamp in nanoseconds, monotonic, ns since the camera started). The
+  value is stamped *before* your fill callback runs, so it is the frame's
+  presentation time; use it to capture your screen/backend at the right
+  moment. The same `pts` is written to the buffer's `Header` meta when that
+  meta is negotiated into the shared buffer (best-effort: the core only
+  allocates meta regions both endpoints agreed on, and some setups — e.g.
+  this project's e2e environment — don't, so the meta write is a no-op
+  there and consumers fall back to their own timing, as the v4l2 node
+  always does).
+- The camera writes the full `SPA_META_Header` (`flags`, `offset`, `pts`,
+  `dts_offset`, `seq`) on each dequeued buffer when the meta is present and
+  fully sized; smaller (partial) meta regions are left untouched, so no
+  out-of-bounds writes are possible. GStreamer-based consumers
+  (`pipewiresrc`) read this meta and map `pts` to the buffer's PTS.
+- The C reference (`reference/redcam.c`) now writes the same real `pts`
+  (CLOCK_MONOTONIC, the domain the v4l2 node stamps on captures) instead of
+  `pts = -1`, and no longer performs an 8-byte partial meta write (which was
+  a latent out-of-bounds write of the 32-byte `seq` field). The oracle
+  (`reference/redcam-test.c`) now also asserts, best-effort, that a
+  producer's `pts` values advance strictly when the Header meta is present.
+
 ## 0.5.0
 
 - The advertised params now include `ParamLatency` objects, one per

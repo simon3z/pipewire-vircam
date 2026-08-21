@@ -174,6 +174,11 @@ cam.run(fill)?;
 - `State` reports `Disconnected { error }` / `Paused { node_id }` /
   `Streaming { node_id }`; `Negotiated` carries `format`, `width`, `height`,
   `fps_num/denom` (plus `fps()`), `stride`, `node_id`.
+- `Frame` also carries timing: `seq` (per-camera frame counter, from 0)
+  and `pts` (presentation timestamp, nanoseconds since the camera started —
+  monotonic). The same `pts` is written to the buffer's `Header` meta when
+  that meta is negotiated (best-effort; GStreamer `pipewiresrc` maps it to
+  the frame PTS). See the changelog for the 0.6.0 note on meta negotiation.
 
 ## How to consume `redcam`
 
@@ -239,6 +244,7 @@ To test the C reference producer instead of the Rust one:
 | `fps` | frames arrive at ≈the requested fps (timer is driving, not a one-shot) |
 | `frames` | N distinct frames were received |
 | `seq_ok` | (best-effort) per-frame sequence advanced — only when the Header meta is negotiated |
+| `pts_ok` | (best-effort) per-frame `pts` advanced strictly — only when the Header meta is present with valid (≥ 0) pts |
 
 `red_ok` is a full-pixel `memcmp` against a precomputed red row for the exact
 negotiated format (`RGB`→`FF0000`, `BGR`→`0000FF`, `RGBA`→`FF0000FF`,
