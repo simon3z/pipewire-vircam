@@ -2,6 +2,24 @@
 
 All notable changes to this crate, per release.
 
+## 0.5.0
+
+- The advertised params now include `ParamLatency` objects, one per
+  direction: the input direction is unset (the node has no input port); the
+  output direction declares one frame per buffer over the min..max advertised
+  fps, with the frame period (ns) at those rates. The negotiation reply
+  (together with `ParamBuffers`) now carries a `ParamLatency` with the
+  negotiated frame period (min = max) — the same value the driver paces by.
+- The advertised `EnumFormat` entries carry `maxFramerate` when the entry has
+  more than one fps choice.
+- Fix: the advertised `EnumFormat` entries no longer carry a `VideoModifier`
+  property (which was always `0`). Its *presence* makes gstreamer-pipewire
+  treat the format as a "modified" one and request DmaBuf-only buffers, which
+  this node cannot provide — capturing with `pipewiresrc` failed with
+  "alloc buffers: Operation not supported". The property is optional
+  (absent = no modifier), and the v4l2 node emits it only for formats with a
+  real modifier.
+
 ## 0.4.0
 
 - The advertised `EnumFormat` entries now carry the colorimetry properties a

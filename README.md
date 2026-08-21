@@ -275,6 +275,18 @@ approach.
   (default + alternatives) when a mode advertises several fps for the same
   (format, size); `pw-topology` renders that as `default: 30/1, alt1: 60/1`,
   and OBS groups consecutive entries into one row with an fps sub-list.
+  A `maxFramerate` property is added when an entry has more than one fps
+  choice. Deliberately absent: `VideoModifier` — its *presence* (even with
+  the value `0`) makes gstreamer-pipewire request DmaBuf-only buffers, and
+  the daemon then fails with "alloc buffers: Operation not supported"; the
+  v4l2 node emits it only for formats with a real modifier.
+- **`ParamLatency` is advertised (static) and replied with (negotiated).**
+  Two `Latency` objects are advertised (input: unset — no input port;
+  output: 1 frame/buffer, min/max rate = the advertised fps range, min/max
+  ns = the frame period at those rates), and the `ParamBuffers` negotiation
+  reply carries the negotiated frame period (min = max) — what the v4l2
+  driver emits after accepting a Format. Browsers (unlike OBS) validate this
+  param when deciding whether a stream is usable.
 - **Source is the DRIVER**; a 1 ms timer produces at most one frame per
   negotiated period (software pacing, so fps survives renegotiation without
   re-arming). The consumer is passive.
