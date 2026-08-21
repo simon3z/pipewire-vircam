@@ -110,11 +110,12 @@ pub fn enumformat_pod(format: Format, width: u32, height: u32, fps: &[FpsChoice]
             flags: PropertyFlags::empty(),
             value: Value::Id(Id(format.video_format().as_raw())),
         },
-        Property {
-            key: FormatProperties::VideoModifier.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Int(0),
-        },
+        // NB: no `VideoModifier` property. Besides being optional (absent = no
+        // modifier, per `spa/param/video/raw-utils.h`), its *presence* makes
+        // gstreamer-pipewire treat the format as a "modified" one and request
+        // DmaBuf-only buffers, which this node cannot provide (the daemon then
+        // fails with "alloc buffers: Operation not supported"). The v4l2 node
+        // emits it only for formats that have a real modifier; we have none.
         Property {
             key: FormatProperties::VideoSize.as_raw(),
             flags: PropertyFlags::empty(),
