@@ -47,6 +47,16 @@ pub struct Frame<'f> {
     pub fps_num: u32,
     /// Framerate denominator (1 for whole-number rates).
     pub fps_denom: u32,
+    /// Frame sequence number: increments by one per produced frame
+    /// (per consumer session, starting at 0).
+    pub seq: u64,
+    /// Presentation timestamp in nanoseconds, monotonic — nanoseconds since
+    /// this camera started ([`Camera::run`](Camera::run)). The same value is
+    /// written to the buffer's `Header` meta (`pts`) when that meta is
+    /// negotiated, so GStreamer-based consumers (`pipewiresrc`) see it as
+    /// the frame PTS. Use it e.g. to capture your screen/backend at the
+    /// right moment; consumers that need deltas only ever use differences.
+    pub pts: u64,
     /// Planes, in plane order. Fill every plane before returning.
     pub planes: Vec<Plane<'f>>,
 }
@@ -154,6 +164,9 @@ struct Inner {
     /// Latest negotiation result (set in `param_changed`, consumed in
     /// `process`; callback access is sequential, no lock needed).
     negotiated: Option<Negotiated>,
+    /// Frame sequence counter (incremented per produced frame). All
+    /// callbacks run on the main-loop thread, so a plain field is fine.
+    seq: u64,
     max_buffers: u32,
     state_cb: Box<dyn FnMut(State)>,
     neg_cb_accept: NegotiateAcceptCb,
@@ -371,6 +384,7 @@ impl Camera {
         let inner = Inner {
             pacing: self.pacing.clone(),
             negotiated: None,
+            seq: 0,
             max_buffers: self.max_buffers,
             state_cb: self.state_cb,
             neg_cb_accept: self.neg_cb_accept,
@@ -570,32 +584,109 @@ fn reply_buffers(stream: &pw::stream::Stream, neg: Negotiated, max_buffers: u32)
     let _ = pw_stream_update_params_ptr(stream.as_raw_ptr(), &blobs);
 }
 
-/// `process`: snapshot the negotiation for this buffer, hand a [`Frame`] to
-/// the fill handler, and return the buffer (dropping it re-queues it).
+/// `process`: dequeue a buffer, stamp its timing, hand a [`Frame`] to the
+/// fill handler, and queue the buffer back on every exit path.
+///
+/// The safe [`pw::stream::Stream::dequeue_buffer`] API does not expose the
+/// buffer's meta regions (and [`pw::buffer::Buffer`] has no writable-meta
+/// API), so we go through the raw stream FFI: `pw_stream_dequeue_buffer`
+/// / `pw_stream_queue_buffer` are thin wrappers, the stream owns the
+/// buffer, and this callback runs on the stream's main-loop thread.
 fn on_process(stream: &pw::stream::Stream, inner: &mut Inner) {
-    let Some(mut buf) = stream.dequeue_buffer() else {
+    // SAFETY: `stream` outlives the listener and this callback runs on the
+    // stream's main-loop thread. `pw_stream_dequeue_buffer` returns a
+    // stream-owned `pw_buffer`, or NULL when no buffer is available.
+    let buf: *mut pw::sys::pw_buffer =
+        unsafe { pw::sys::pw_stream_dequeue_buffer(stream.as_raw_ptr()) };
+    if buf.is_null() {
         return;
-    };
-    // Snapshot the negotiation for this buffer. `negotiated`
-    // may be replaced by a later `param_changed` (renegotiation),
-    // so every field used below comes from this local copy.
-    let Some(neg) = inner.negotiated else {
-        return; // not negotiated yet; buffer queued as-is
+    }
+    // SAFETY: `buf` is non-null and owned by the stream; everything between
+    // dequeue and queue below runs on the main-loop thread and holds no
+    // reference into the buffer when `queue` is called (see `process_buffer`
+    // — all locals borrow only within that function). Queueing recycles the
+    // buffer; it is not dropped here.
+    unsafe {
+        process_buffer(inner, buf);
+        pw::sys::pw_stream_queue_buffer(stream.as_raw_ptr(), buf);
+    }
+}
+
+/// Stamp the buffer's timing (seq/pts), build the [`Frame`] views and call
+/// the user fill handler. The buffer is queued back by the caller.
+fn process_buffer(inner: &mut Inner, buf: *mut pw::sys::pw_buffer) {
+    // Snapshot the negotiation for this buffer. `negotiated` may be replaced
+    // by a later `param_changed` (renegotiation), so every field used below
+    // comes from this local copy.
+    let Some(neg) = inner.negotiated else { return };
+    // SAFETY: `buf` is non-null (checked by the caller) and stream-owned.
+    let sbuf: *mut pw::spa::sys::spa_buffer = unsafe { (*buf).buffer };
+
+    // Rebuild the `datas` slice exactly like the safe `Buffer::datas_mut`
+    // does (same null/length guards, same cast — `Data` is
+    // `#[repr(transparent)]` over `spa_data`).
+    let mut empty: [Data; 0] = [];
+    let datas: &mut [Data] = unsafe {
+        if !sbuf.is_null() && (*sbuf).n_datas > 0 && !(*sbuf).datas.is_null() {
+            std::slice::from_raw_parts_mut((*sbuf).datas as *mut Data, (*sbuf).n_datas as usize)
+        } else {
+            &mut empty
+        }
     };
     let layout = neg.format.planes(neg.width, neg.height);
-    let Some(planes) = build_planes(buf.datas_mut(), &layout) else {
+    let Some(planes) = build_planes(datas, &layout) else {
         return;
     };
+
+    // Stamp the Header meta *before* the fill callback, so `pts` is the
+    // frame's presentation time and the user can render for it. `seq` is the
+    // per-camera frame counter, `pts` the monotonic now (ns since start).
+    let seq = inner.seq;
+    inner.seq += 1;
+    let pts = now_ns();
+    write_header_meta(sbuf, seq, pts);
+
     let mut frame = Frame {
         width: neg.width,
         height: neg.height,
         format: neg.format,
         fps_num: neg.fps_num,
         fps_denom: neg.fps_denom,
+        seq,
+        pts,
         planes,
     };
     (inner.fill)(&mut frame, &neg);
-    // Dropping `buf` queues the buffer back to the stream.
+}
+
+/// Write the `SPA_META_Header` meta (`flags`, `offset`, `pts`, `dts_offset`,
+/// `seq`) if the buffer carries a *full* one (32 bytes). A smaller meta
+/// region is left untouched — writing only what the negotiated size
+/// guarantees (no partial writes).
+///
+/// SAFETY: `sbuf` must be non-null and point at a buffer we hold (dequeued,
+/// not shared). `spa_buffer_find_meta` is a read-only lookup over
+/// `sbuf->metas`; the only write is to the meta's own payload, guarded by
+/// `size >= sizeof(spa_meta_header)`.
+fn write_header_meta(sbuf: *mut pw::spa::sys::spa_buffer, seq: u64, pts: u64) {
+    // SAFETY: see above.
+    let m: *mut pw::spa::sys::spa_meta =
+        unsafe { pw::spa::sys::spa_buffer_find_meta(sbuf, pw::spa::sys::SPA_META_Header) };
+    if m.is_null() {
+        return;
+    }
+    // SAFETY: `m` is a live `spa_meta` element inside the buffer we hold.
+    let m = unsafe { &mut *m };
+    if m.size < std::mem::size_of::<pw::spa::sys::spa_meta_header>() as u32 {
+        return;
+    }
+    // SAFETY: the size check guarantees a full `spa_meta_header` at `m.data`.
+    let h = unsafe { &mut *(m.data as *mut pw::spa::sys::spa_meta_header) };
+    h.flags = 0;
+    h.offset = 0;
+    h.pts = pts as i64;
+    h.dts_offset = 0;
+    h.seq = seq;
 }
 
 /// Build the [`Frame`] plane views from the buffer's `datas` and the
@@ -636,4 +727,79 @@ fn build_planes<'b>(datas: &'b mut [Data], layout: &[(u32, u32)]) -> Option<Vec<
         });
     }
     Some(planes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a stack `spa_buffer` that carries one `Header` meta whose
+    /// payload is `payload` (of `size` bytes), and return the buffer pointer.
+    fn buffer_with_meta(
+        meta: &mut pw::spa::sys::spa_meta,
+        payload: &mut pw::spa::sys::spa_buffer,
+    ) -> *mut pw::spa::sys::spa_buffer {
+        payload.n_metas = 1;
+        payload.metas = meta;
+        payload.n_datas = 0;
+        payload.datas = std::ptr::null_mut();
+        payload as *mut pw::spa::sys::spa_buffer
+    }
+
+    #[test]
+    fn writes_full_header_meta() {
+        let mut payload: pw::spa::sys::spa_meta_header = unsafe { std::mem::zeroed() };
+        payload.seq = 0xffff_ffff_ffff_ffff; // sentinel
+        let mut meta = pw::spa::sys::spa_meta {
+            type_: pw::spa::sys::SPA_META_Header,
+            size: std::mem::size_of::<pw::spa::sys::spa_meta_header>() as u32,
+            data: &mut payload as *mut _ as *mut _,
+        };
+        let mut buffer: pw::spa::sys::spa_buffer = unsafe { std::mem::zeroed() };
+        let buf = buffer_with_meta(&mut meta, &mut buffer);
+
+        write_header_meta(buf, 42, 1_000_000_000);
+
+        assert_eq!(payload.flags, 0);
+        assert_eq!(payload.offset, 0);
+        assert_eq!(payload.pts, 1_000_000_000);
+        assert_eq!(payload.dts_offset, 0);
+        assert_eq!(payload.seq, 42);
+    }
+
+    /// A meta region smaller than the full 32-byte header must be left
+    /// untouched (no partial writes, no OOB).
+    #[test]
+    fn leaves_small_meta_untouched() {
+        let mut payload: u64 = 0;
+        let mut meta = pw::spa::sys::spa_meta {
+            type_: pw::spa::sys::SPA_META_Header,
+            size: 8,
+            data: &mut payload as *mut _ as *mut _,
+        };
+        let mut buffer: pw::spa::sys::spa_buffer = unsafe { std::mem::zeroed() };
+        let buf = buffer_with_meta(&mut meta, &mut buffer);
+
+        write_header_meta(buf, 42, 1_000_000_000);
+
+        assert_eq!(payload, 0);
+    }
+
+    /// A buffer without any Header meta (e.g. only the auto `Busy` meta) is
+    /// a no-op.
+    #[test]
+    fn no_meta_is_a_noop() {
+        let mut payload: u64 = 0;
+        let mut meta = pw::spa::sys::spa_meta {
+            type_: pw::spa::sys::SPA_META_Busy,
+            size: 8,
+            data: &mut payload as *mut _ as *mut _,
+        };
+        let mut buffer: pw::spa::sys::spa_buffer = unsafe { std::mem::zeroed() };
+        let buf = buffer_with_meta(&mut meta, &mut buffer);
+
+        write_header_meta(buf, 42, 1_000_000_000);
+
+        assert_eq!(payload, 0);
+    }
 }

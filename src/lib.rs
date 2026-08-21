@@ -30,6 +30,9 @@
 //!     // Called from the camera thread at the negotiated fps, only while a
 //!     // consumer is connected and streaming. `frame` is self-describing:
 //!     // width/height/format, and one fillable `Plane` per buffer plane.
+//!     // `frame.seq` counts produced frames; `frame.pts` is the monotonic
+//!     // presentation timestamp (ns since the camera started) — capture
+//!     // your backend at that moment if you render asynchronously.
 //!     // Fill each plane's `data` (already sized stride x height).
 //!     for p in &mut frame.planes {
 //!         p.data.fill(0); /* e.g. a black frame */
