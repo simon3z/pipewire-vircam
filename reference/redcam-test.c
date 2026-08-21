@@ -62,8 +62,11 @@ struct data {
 	bool		size_ok;
 	bool		red_bad;
 	bool		seq_bad;
+	bool		pts_bad;
 	uint32_t	seq_frames;
+	uint32_t	pts_frames;
 	uint32_t	last_seq;
+	int64_t	last_pts;
 	bool		row_built;
 	uint32_t	force_fmt; /* 0 = all, else single format */
 	uint32_t	want_w, want_h; /* requested size */
@@ -314,6 +317,12 @@ static void check_frame(struct data *data, struct pw_buffer *b)
 			if (data->seq_frames > 1 && h->seq == data->last_seq)
 				data->seq_bad = true;
 			data->last_seq = h->seq;
+			if (h->pts >= 0) {
+				data->pts_frames++;
+				if (data->pts_frames > 1 && h->pts <= data->last_pts)
+					data->pts_bad = true;
+				data->last_pts = h->pts;
+			}
 		}
 	}
 }
@@ -335,22 +344,32 @@ static void finish(struct data *data)
 	 * graph agrees on it. The upstream video-src.c example likewise
 	 * guards its seq write with a NULL check. So we only assert seq
 	 * advancement when the meta was actually present. */
+	/* The Header meta (which carries per-frame seq/pts) is best-effort:
+	 * PipeWire only negotiates it into the shared buffer when the
+	 * graph agrees on it. The upstream video-src.c example likewise
+	 * guards its seq write with a NULL check. So we only assert seq
+	 * advancement and pts monotonicity when the meta was actually
+	 * present. A producer that writes pts=-1 (invalid) is accepted;
+	 * a producer that writes valid pts must advance it strictly. */
 	bool seq_checked = data->seq_frames >= 2;
 	bool seq_pass = !seq_checked ||
 			(data->seq_frames == data->frames_seen && !data->seq_bad);
 	seq_ok = seq_pass;
+	bool pts_pass = !data->pts_bad;
 	/* Framerate: the measured fps must be within +/-20% of the
 	 * requested fps (PipeWire's timer pacing is not perfectly exact). */
 	double want = (double)data->want_fps_denom * (double)data->want_fps_num;
 	double tol_lo = want * 0.8, tol_hi = want * 1.2;
 	bool fps_ok = fps >= tol_lo && fps <= tol_hi;
 	pass = data->frames_seen >= data->n_frames &&
-	       data->size_ok && red_ok && seq_pass && fps_ok;
+	       data->size_ok && red_ok && seq_pass && pts_pass && fps_ok;
 
 	printf("frames=%u/%u size_ok=%d red_ok=%d seq_ok=%d seq_frames=%u "
+	       "pts_ok=%d pts_frames=%u "
 	       "fps=%.2f negotiated=%u %ux%u@%u/%u\n",
 	       data->frames_seen, data->n_frames,
 	       data->size_ok, red_ok, seq_ok, data->seq_frames,
+	       (int)pts_pass, data->pts_frames,
 	       fps, data->format.format,
 	       data->format.size.width, data->format.size.height,
 	       data->format.framerate.num,
@@ -364,8 +383,10 @@ static void finish(struct data *data)
 		if (!seq_ok)
 			printf("FAIL: frame sequence did not advance on every frame\n");
 	} else {
-		printf("note: header meta not negotiated; seq check skipped\n");
+		printf("note: header meta not negotiated; seq/pts check skipped\n");
 	}
+	if (!pts_pass)
+		printf("FAIL: frame pts did not advance monotonically\n");
 	if (!fps_ok)
 		printf("FAIL: measured fps %.2f outside [%0.2f, %0.2f] (requested %d/%d)\n",
 		       fps, tol_lo, tol_hi,

@@ -18,8 +18,10 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include <spa/param/video/raw.h>
 #include <spa/param/video/raw-utils.h>
@@ -58,6 +60,15 @@ static size_t bpp(uint32_t format)
 	default:
 		return 0;
 	}
+}
+
+/* monotonic wall-clock in nanoseconds (CLOCK_MONOTONIC, the same domain
+ * the v4l2 node stamps on captured buffers). */
+static uint64_t now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 /* Write one solid red row of `width` pixels in `format` byte order. */
@@ -137,18 +148,18 @@ static void on_process(void *userdata)
 	{
 		struct spa_meta *m;
 
-		/* write only what the negotiated meta size guarantees */
-		if ((m = spa_buffer_find_meta(buf, SPA_META_Header)) != NULL) {
-			if (m->size >= sizeof(struct spa_meta_header)) {
-				struct spa_meta_header *h = m->data;
-				h->flags = 0;
-				h->seq = data->seq++;
-				h->dts_offset = 0;
-			} else if (m->size >= 8) {
-				struct spa_meta_header *h = m->data;
-				h->flags = 0;
-				h->seq = data->seq++;
-			}
+		/* Fill the header meta with seq + pts. Best-effort: only
+		 * write when the meta is actually present and fully
+		 * sized. We never write a partial 32-byte struct, so a
+		 * smaller (e.g. 8-byte) allocation can't be corrupted. */
+		if ((m = spa_buffer_find_meta(buf, SPA_META_Header)) != NULL &&
+		    m->size >= sizeof(struct spa_meta_header)) {
+			struct spa_meta_header *h = m->data;
+			h->flags = 0;
+			h->offset = 0;
+			h->seq = data->seq++;
+			h->pts = (int64_t)now_ns();
+			h->dts_offset = 0;
 		}
 	}
 
