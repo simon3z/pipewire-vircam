@@ -487,7 +487,8 @@ fn on_state_changed(
 }
 
 /// `param_changed`: parse the negotiated Format, snapshot it, update the
-/// driver period, and reply with `ParamBuffers` + a `meta` (Header) request.
+/// driver period, and reply with `ParamBuffers` + `ParamLatency` (the frame
+/// period at the negotiated rate) + a `meta` (Header) request.
 ///
 /// **The reply is the acknowledgement.** PipeWire will not enter `Streaming`
 /// until the source has replied with params that are compatible with what
@@ -546,19 +547,25 @@ fn on_param_changed(
     reply_buffers(stream, neg, inner.max_buffers);
 }
 
-/// Reply with `ParamBuffers` (and re-request the Header meta) — the
-/// acknowledgement that we accepted the consumer's (format, size, fps).
+/// Reply with `ParamBuffers` + `ParamLatency` (and re-request the Header
+/// meta) — the acknowledgement that we accepted the consumer's
+/// (format, size, fps).
 ///
 /// `blocks` is the number of data blocks (planes) per buffer; `size` is the
 /// size of the *first* block (`stride × height`), and the stride of the first
 /// block. PipeWire derives the per-plane layout from the negotiated video
 /// format, so we only need to describe the primary block here (matching
 /// upstream `video-src.c` and the `redcam-test` oracle).
+///
+/// The `ParamLatency` reply carries the real latency for this negotiation:
+/// the frame period at the negotiated rate (min = max), one frame per
+/// buffer — the same value the driver timer paces by.
 fn reply_buffers(stream: &pw::stream::Stream, neg: Negotiated, max_buffers: u32) {
     let num_planes = neg.format.planes(neg.width, neg.height).len() as u32;
     let blobs: Vec<Vec<u8>> = vec![
         pod::meta_pod(),
         pod::buffers_pod(neg.stride, neg.height, num_planes, max_buffers),
+        pod::negotiated_latency_pod(neg.fps_num, neg.fps_denom),
     ];
     let _ = pw_stream_update_params_ptr(stream.as_raw_ptr(), &blobs);
 }
