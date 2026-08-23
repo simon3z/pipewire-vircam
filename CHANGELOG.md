@@ -2,6 +2,31 @@
 
 All notable changes to this crate, per release.
 
+## 0.7.0
+
+- **Breaking:** removed the planar formats `Format::I420`, `Format::Nv12`,
+  and `Format::Nv21`. The crate now advertises and fills only packed
+  formats (RGBA, BGRA, BGRx, RGBx, BGR, RGB, YUY2, UYVY, GREY). Chrome
+  negotiates a planar format (e.g. I420) when it is advertised and then
+  churns between Paused and Streaming, while packed-only works reliably.
+  Planar support will be reintroduced once the Chrome-side rejection of the
+  planar buffer path is fixed.
+- POD: YUY2/UYVY now advertise limited range (16-235), BT.601 matrix, and
+  BT.709 transfer + primaries (matching a real webcam; Chrome requires this).
+  RGB keeps full range. Each buffer requests a `Header` meta (carries PTS),
+  like a real camera. The initial connect no longer advertises `ParamLatency`
+  (matching the C reference).
+- The reference implementation (`reference/redcam.c`) now advertises YUY2 and
+  UYVY, fills the `Header` meta (PTS/seq), sets `MAP_BUFFERS`, and uses
+  `media.role = "Camera"` so browsers list the node as a camera source.
+- `Frame::fill_black` and the `redcam` binary fill only packed formats.
+- Internal refactor (no API change): the colorimetry constants in `pod.rs`
+  that the sys bindings don't expose (`SPA_VIDEO_COLOR_TRANSFER_BT709`,
+  `SPA_VIDEO_COLOR_PRIMARIES_BT709`) are now inlined at the property site
+  instead of being module constants, and `pod.rs`/`camera.rs` were split
+  into small private helpers (e.g. `format_properties`, `connect_output_
+  stream`, `parse_negotiated`).
+
 ## 0.6.0
 
 - `Frame` now exposes timing: `seq` (a per-camera frame counter, starting at

@@ -260,10 +260,12 @@ approach.
 
 ## Design notes
 
-- **Official `pipewire` 0.10 crate**, safe API throughout except three narrow
-  `sys` calls (`pw_stream_connect`, `pw_stream_update_params`, whose `&mut
-  [&Pod]` arguments can't be built from owned PODs in this crate version, and
-  `pw_stream_is_lazy`, which has no safe wrapper).
+- **Official `pipewire` 0.10 crate**, safe API throughout except a few
+  narrow `sys` calls where the safe wrappers don't fit: `pw_stream_connect`
+  and `pw_stream_update_params` (their `&mut [&Pod]` arguments can't be built
+  from owned PODs in this crate version), `pw_stream_is_lazy` (no safe
+  wrapper), and the buffer dequeue/queue pair (the safe API doesn't expose
+  the buffer's meta regions).
 - **`pw_stream`** API (as in upstream `video-src.c` / `video-play.c`), not a
   raw SPA node export — it handles buffer allocation and negotiation plumbing.
 - **Fixed spec, packed uncompressed formats.** The demo advertises 1920×1080@30
