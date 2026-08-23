@@ -4,9 +4,7 @@
 //! (format, size, fps) combination, all with *plain* values — OBS's
 //! `camera-portal.c` parses the size as a plain `Rectangle` and drops
 //! range/choice encodings, so every advertised (format, size, fps) is a
-//! plain value), the `ParamLatency` objects (one per direction, values
-//! derived from the advertised fps range), and the `ParamBuffers` /
-//! `ParamMeta` negotiation replies.
+//! plain value) and the `ParamBuffers` / `ParamMeta` negotiation replies.
 //!
 //! The `pipewire` crate's safe `connect`/`update_params` take `&mut [&Pod]`,
 //! which cannot be built from owned PODs (as of pipewire 0.10: `Pod` is
@@ -30,17 +28,6 @@ use crate::{Config, Format};
 pub const MAX_BUFFERS: i32 = 16;
 
 /// The `spa_video_color_*` enums the v4l2 node advertises
-/// (`SPA_FORMAT_VIDEO_color*`). The v4l2 node uses plain `Id` values (see
-/// `v4l2-format-utils.c::add_colorimetry`), and the `spa_video_format_*`
-/// helpers the v4l2 node uses wrap those same ints. `pw-topology`'s
-/// `video.c` decodes them back to `"16-235"`, `"bt601"`, `"bt709"`, ... by
-/// value.
-const COLOR_RANGE_0_255: u32 = pw::spa::sys::SPA_VIDEO_COLOR_RANGE_0_255;
-const COLOR_RANGE_16_235: u32 = pw::spa::sys::SPA_VIDEO_COLOR_RANGE_16_235;
-const COLOR_MATRIX_BT601: u32 = pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT601;
-const COLOR_TRANSFER_BT709: u32 = pw::spa::sys::SPA_VIDEO_TRANSFER_BT709;
-const COLOR_PRIMARIES_BT709: u32 = pw::spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT709;
-
 /// A single framerate choice as a `(num, denom)` fraction.
 ///
 /// `Mode::fps` entries are whole frame rates (`fps/1`); the denominator is
@@ -54,17 +41,93 @@ pub type FpsChoice = (u32, u32);
 /// fractions — the "multiple fps choices" shape `pw-topology` shows as
 /// `default: 10/1, alt1: ...`.
 pub fn enumformat_pod(format: Format, width: u32, height: u32, fps: &[FpsChoice]) -> Vec<u8> {
-    // Match real webcam behavior: limited range (16-235),
-    // BT.601 matrix, BT.709 transfer + primaries. Packed Y'UV formats get
-    // limited range (Chrome requires this for YUY2); RGB gets full range
-    // (ignored by decoders).
-    let range = match format {
-        Format::Yuy2 | Format::Uvyvy => COLOR_RANGE_16_235,
-        _ => COLOR_RANGE_0_255, // RGB: full range (ignored by decoders)
+    // NB: no `VideoModifier` property. Besides being optional (absent = no
+    // modifier, per `spa/param/video/raw-utils.h`), its *presence* makes
+    // gstreamer-pipewire treat the format as a "modified" one and request
+    // DmaBuf-only buffers, which this node cannot provide (the daemon then
+    // fails with "alloc buffers: Operation not supported"). The v4l2 node
+    // emits it only for formats that have a real modifier; we have none.
+    let mut properties = format_properties(format, width, height, fps);
+    if let Some((num, denom)) = max_framerate(fps) {
+        properties.push(Property {
+            key: pw::spa::sys::SPA_FORMAT_VIDEO_maxFramerate,
+            flags: PropertyFlags::empty(),
+            value: Value::Fraction(Fraction { num, denom }),
+        });
+    }
+    let obj = Object {
+        type_: SpaTypes::ObjectParamFormat.as_raw(),
+        id: ParamType::EnumFormat.as_raw(),
+        properties,
     };
-    let matrix = COLOR_MATRIX_BT601;
-    // Build the framerate choice (enum): default = first, alternatives = rest.
-    let framerate = if fps.len() == 1 {
+    serialize(obj)
+}
+
+/// The base `EnumFormat` properties for one (format, size) pair.
+fn format_properties(format: Format, width: u32, height: u32, fps: &[FpsChoice]) -> Vec<Property> {
+    // Match real webcam behavior: limited range (16-235), BT.601 matrix,
+    // BT.709 transfer + primaries. Packed Y'UV formats get limited range
+    // (Chrome requires this for YUY2); RGB gets full range (ignored by
+    // decoders). The v4l2 node advertises these as plain `Id` values and
+    // `pw-topology`'s `video.c` decodes them back by value.
+    let range = match format {
+        Format::Yuy2 | Format::Uvyvy => pw::spa::sys::SPA_VIDEO_COLOR_RANGE_16_235,
+        _ => pw::spa::sys::SPA_VIDEO_COLOR_RANGE_0_255,
+    };
+    vec![
+        Property {
+            key: FormatProperties::MediaType.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: Value::Id(Id(MediaType::Video.as_raw())),
+        },
+        Property {
+            key: FormatProperties::MediaSubtype.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: Value::Id(Id(MediaSubtype::Raw.as_raw())),
+        },
+        Property {
+            key: FormatProperties::VideoFormat.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: Value::Id(Id(format.video_format().as_raw())),
+        },
+        Property {
+            key: FormatProperties::VideoSize.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: Value::Rectangle(Rectangle { width, height }),
+        },
+        Property {
+            key: FormatProperties::VideoFramerate.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: framerate_value(fps),
+        },
+        Property {
+            key: FormatProperties::VideoColorRange.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: Value::Id(Id(range)),
+        },
+        Property {
+            key: FormatProperties::VideoColorMatrix.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: Value::Id(Id(pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT601)),
+        },
+        Property {
+            key: FormatProperties::VideoTransferFunction.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: Value::Id(Id(5)), // SPA_VIDEO_COLOR_TRANSFER_BT709 = 5
+        },
+        Property {
+            key: FormatProperties::VideoColorPrimaries.as_raw(),
+            flags: PropertyFlags::empty(),
+            value: Value::Id(Id(1)), // SPA_VIDEO_COLOR_PRIMARIES_BT709 = 1
+        },
+    ]
+}
+
+/// Framerate choice value for `fps`: a plain `Fraction` for a single rate,
+/// or a `Choice` (enum) of fractions for several — the "multiple fps
+/// choices" shape `pw-topology` renders as `default: 30/1, alt1: 60/1`.
+fn framerate_value(fps: &[FpsChoice]) -> Value {
+    if fps.len() == 1 {
         Value::Fraction(Fraction {
             num: fps[0].0,
             denom: fps[0].1,
@@ -83,81 +146,20 @@ pub fn enumformat_pod(format: Format, width: u32, height: u32, fps: &[FpsChoice]
                     .collect(),
             },
         )))
-    };
-    // Maximum framerate we can sustain at this (format, size). Real camera
-    // nodes advertise it; browsers use it to validate the negotiated rate.
-    // Only emitted when there is more than one choice (a single-choice enum
-    // already pins the rate exactly).
-    let max_fps = fps.iter().fold(0u32, |m, &(n, d)| m.max(d.max(1) * n));
-    let mut properties: Vec<Property> = vec![
-        Property {
-            key: FormatProperties::MediaType.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Id(Id(MediaType::Video.as_raw())),
-        },
-        Property {
-            key: FormatProperties::MediaSubtype.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Id(Id(MediaSubtype::Raw.as_raw())),
-        },
-        Property {
-            key: FormatProperties::VideoFormat.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Id(Id(format.video_format().as_raw())),
-        },
-        // NB: no `VideoModifier` property. Besides being optional (absent = no
-        // modifier, per `spa/param/video/raw-utils.h`), its *presence* makes
-        // gstreamer-pipewire treat the format as a "modified" one and request
-        // DmaBuf-only buffers, which this node cannot provide (the daemon then
-        // fails with "alloc buffers: Operation not supported"). The v4l2 node
-        // emits it only for formats that have a real modifier; we have none.
-        Property {
-            key: FormatProperties::VideoSize.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Rectangle(Rectangle { width, height }),
-        },
-        Property {
-            key: FormatProperties::VideoFramerate.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: framerate,
-        },
-        Property {
-            key: FormatProperties::VideoColorRange.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Id(Id(range)),
-        },
-        Property {
-            key: FormatProperties::VideoColorMatrix.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Id(Id(matrix)),
-        },
-        Property {
-            key: FormatProperties::VideoTransferFunction.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Id(Id(COLOR_TRANSFER_BT709)),
-        },
-        Property {
-            key: FormatProperties::VideoColorPrimaries.as_raw(),
-            flags: PropertyFlags::empty(),
-            value: Value::Id(Id(COLOR_PRIMARIES_BT709)),
-        },
-    ];
-    if fps.len() > 1 && max_fps > 0 {
-        properties.push(Property {
-            key: pw::spa::sys::SPA_FORMAT_VIDEO_maxFramerate,
-            flags: PropertyFlags::empty(),
-            value: Value::Fraction(Fraction {
-                num: max_fps,
-                denom: 1,
-            }),
-        });
     }
-    let obj = Object {
-        type_: SpaTypes::ObjectParamFormat.as_raw(),
-        id: ParamType::EnumFormat.as_raw(),
-        properties,
-    };
-    serialize(obj)
+}
+
+/// The maximum advertised framerate as `(num, denom)`, for the
+/// `maxFramerate` property. Real camera nodes advertise it; browsers use it
+/// to validate the negotiated rate. Only emitted for multi-choice entries
+/// (a single-choice enum already pins the rate exactly).
+fn max_framerate(fps: &[FpsChoice]) -> Option<(u32, u32)> {
+    if fps.len() > 1 {
+        let num = fps.iter().fold(0u32, |m, &(n, d)| m.max(d.max(1) * n));
+        Some((num, 1))
+    } else {
+        None
+    }
 }
 
 /// `ParamBuffers` reply: accept 2..MAX_BUFFERS buffers of the negotiated
@@ -173,37 +175,48 @@ pub fn buffers_pod(stride: u32, height: u32, num_planes: u32, max_buffers: u32) 
     let obj = Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: ParamType::Buffers.as_raw(),
-        properties: vec![
-            Property {
-                key: pw::spa::sys::SPA_PARAM_BUFFERS_buffers,
-                flags: PropertyFlags::empty(),
-                value: Value::Choice(pw::spa::pod::ChoiceValue::Int(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Range {
-                        default: default as i32,
-                        min: min as i32,
-                        max: max as i32,
-                    },
-                ))),
-            },
-            Property {
-                key: pw::spa::sys::SPA_PARAM_BUFFERS_blocks,
-                flags: PropertyFlags::empty(),
-                value: Value::Int(num_planes as i32),
-            },
-            Property {
-                key: pw::spa::sys::SPA_PARAM_BUFFERS_size,
-                flags: PropertyFlags::empty(),
-                value: Value::Int(stride as i32 * height as i32),
-            },
-            Property {
-                key: pw::spa::sys::SPA_PARAM_BUFFERS_stride,
-                flags: PropertyFlags::empty(),
-                value: Value::Int(stride as i32),
-            },
-        ],
+        properties: buffers_properties((min, max, default), num_planes, stride, height),
     };
     serialize(obj)
+}
+
+/// The `ParamBuffers` properties: the buffer-count range and the first
+/// (primary) plane's block count, size and stride.
+fn buffers_properties(
+    (min, max, default): (u32, u32, u32),
+    num_planes: u32,
+    stride: u32,
+    height: u32,
+) -> Vec<Property> {
+    vec![
+        Property {
+            key: pw::spa::sys::SPA_PARAM_BUFFERS_buffers,
+            flags: PropertyFlags::empty(),
+            value: Value::Choice(pw::spa::pod::ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: default as i32,
+                    min: min as i32,
+                    max: max as i32,
+                },
+            ))),
+        },
+        Property {
+            key: pw::spa::sys::SPA_PARAM_BUFFERS_blocks,
+            flags: PropertyFlags::empty(),
+            value: Value::Int(num_planes as i32),
+        },
+        Property {
+            key: pw::spa::sys::SPA_PARAM_BUFFERS_size,
+            flags: PropertyFlags::empty(),
+            value: Value::Int(stride as i32 * height as i32),
+        },
+        Property {
+            key: pw::spa::sys::SPA_PARAM_BUFFERS_stride,
+            flags: PropertyFlags::empty(),
+            value: Value::Int(stride as i32),
+        },
+    ]
 }
 
 /// `ParamMeta` object asking for a `Header` meta alongside the video data.
@@ -230,9 +243,8 @@ pub fn meta_pod() -> Vec<u8> {
 }
 
 /// The blobs to advertise for `config`: one plain-values Format object per
-/// unique (format, size, fps) combination, one `Latency` object per
-/// direction (values derived from the advertised fps range), followed by a
-/// `meta` (Header) request.
+/// unique (format, size, fps) combination, followed by a `meta` (Header)
+/// request.
 ///
 /// Loop order: FORMAT outer, FPS inner, so entries with the same
 /// (size, format) are *consecutive* — this lets OBS group them into a

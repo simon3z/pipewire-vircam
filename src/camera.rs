@@ -170,6 +170,38 @@ impl QuitHandle {
     }
 }
 
+/// Connect the stream in output direction and advertise `param_blobs`.
+///
+/// SAFETY: each blob is a well-formed serialized POD (built and round-trip
+/// parsed in [`pod::serialize`]) and outlives the call, so the borrowed
+/// pointer array is valid for the duration of the FFI call.
+fn connect_output_stream(
+    stream: &pw::stream::StreamRc,
+    param_blobs: Vec<Vec<u8>>,
+) -> Result<(), Error> {
+    // The safe `connect`'s `&mut [&Pod]` argument cannot be built from owned
+    // PODs in pipewire 0.10, so call the C function with a borrowed pointer
+    // array (the blobs outlive the call).
+    let mut pod_ptrs: Vec<*const pw::spa::sys::spa_pod> =
+        param_blobs.iter().map(|b| b.as_ptr() as *const _).collect();
+    let r = unsafe {
+        pw::sys::pw_stream_connect(
+            stream.as_raw_ptr(),
+            Direction::Output.as_raw(),
+            pw::constants::ID_ANY,
+            // DRIVER: we own the clock. MAP_BUFFERS: Chrome requires this to
+            // map buffers into its address space (matches the C reference).
+            (pw::stream::StreamFlags::DRIVER | pw::stream::StreamFlags::MAP_BUFFERS).bits(),
+            pod_ptrs.as_mut_ptr(),
+            pod_ptrs.len() as u32,
+        )
+    };
+    if r < 0 {
+        return Err(Error::Connect(format!("pw_stream_connect: {r}")));
+    }
+    Ok(())
+}
+
 fn validate(config: &Config) -> Result<(), Error> {
     if config.name.is_empty() {
         return Err(Error::InvalidConfig("name must not be empty".into()));
@@ -243,29 +275,7 @@ impl Camera {
         // EnumFormat params: one plain-value Format object per
         // (format, size, fps) combination (OBS requires plain values),
         // plus a `ParamMeta` (Header) request.
-        let param_blobs = pod::advertised_param_blobs(&config);
-
-        // The safe `connect`'s `&mut [&Pod]` argument cannot be built from
-        // owned PODs in pipewire 0.10, so call the C function with a
-        // borrowed pointer array (the blobs outlive the call).
-        let mut pod_ptrs: Vec<*const pw::spa::sys::spa_pod> =
-            param_blobs.iter().map(|b| b.as_ptr() as *const _).collect();
-        let r = unsafe {
-            pw::sys::pw_stream_connect(
-                stream.as_raw_ptr(),
-                Direction::Output.as_raw(),
-                pw::constants::ID_ANY,
-                // DRIVER: we own the clock. MAP_BUFFERS: Chrome requires
-                // this to map buffers into its address space (matches
-                // the C reference).
-                (pw::stream::StreamFlags::DRIVER | pw::stream::StreamFlags::MAP_BUFFERS).bits(),
-                pod_ptrs.as_mut_ptr(),
-                pod_ptrs.len() as u32,
-            )
-        };
-        if r < 0 {
-            return Err(Error::Connect(format!("pw_stream_connect: {r}")));
-        }
+        connect_output_stream(&stream, pod::advertised_param_blobs(&config))?;
 
         Ok(Camera {
             max_buffers: config.max_buffers,
@@ -472,8 +482,7 @@ fn on_state_changed(
 }
 
 /// `param_changed`: parse the negotiated Format, snapshot it, update the
-/// driver period, and reply with `ParamBuffers` + `ParamLatency` (the frame
-/// period at the negotiated rate) + a `meta` (Header) request.
+/// driver period, and reply with `ParamBuffers` + a `meta` (Header) request.
 ///
 /// **The reply is the acknowledgement.** PipeWire will not enter `Streaming`
 /// until the source has replied with params that are compatible with what
@@ -492,26 +501,11 @@ fn on_param_changed(
     if id != ParamType::Format.as_raw() {
         return;
     }
-    let Some(param) = param else { return };
-    if param.type_().as_raw() != SpaTypes::Object.as_raw() {
-        return;
-    }
-    let mut info = libspa::param::video::VideoInfoRaw::default();
-    if info.parse(param).is_err() {
-        return;
-    }
-    let Some(format) = Format::from_spa_id(info.format().0) else {
+    let Some(param) = param else {
         return;
     };
-    let (stride, _h) = format.planes(info.size().width, info.size().height)[0];
-    let neg = Negotiated {
-        format,
-        width: info.size().width,
-        height: info.size().height,
-        fps_num: info.framerate().num,
-        fps_denom: info.framerate().denom,
-        stride,
-        node_id: stream.node_id(),
+    let Some(neg) = parse_negotiated(param, stream.node_id()) else {
+        return;
     };
     inner.pacing.period_ns.store(
         neg.fps_denom as u64 * 1_000_000_000 / neg.fps_num.max(1) as u64,
@@ -532,9 +526,8 @@ fn on_param_changed(
     reply_buffers(stream, neg, inner.max_buffers);
 }
 
-/// Reply with `ParamBuffers` + `ParamLatency` (and re-request the Header
-/// meta) — the acknowledgement that we accepted the consumer's
-/// (format, size, fps).
+/// Reply with `ParamBuffers` (and re-request the Header meta) — the
+/// acknowledgement that we accepted the consumer's (format, size, fps).
 ///
 /// `blocks` is the number of data blocks (planes) per buffer; `size` is the
 /// size of the *first* block (`stride × height`), and the stride of the first
@@ -542,14 +535,32 @@ fn on_param_changed(
 /// format, so we only need to describe the primary block here (matching
 /// upstream `video-src.c` and the `redcam-test` oracle).
 ///
-/// The `ParamLatency` reply carries the real latency for this negotiation:
-/// the frame period at the negotiated rate (min = max), one frame per
-/// buffer — the same value the driver timer paces by.
+/// Parse the consumer's Format param into a [`Negotiated`], or `None` if the
+/// param is not a parseable video format we support.
+fn parse_negotiated(param: &pw::spa::pod::Pod, node_id: u32) -> Option<Negotiated> {
+    if param.type_().as_raw() != SpaTypes::Object.as_raw() {
+        return None;
+    }
+    let mut info = libspa::param::video::VideoInfoRaw::default();
+    if info.parse(param).is_err() {
+        return None;
+    }
+    let format = Format::from_spa_id(info.format().0)?;
+    let (stride, _h) = format.planes(info.size().width, info.size().height)[0];
+    Some(Negotiated {
+        format,
+        width: info.size().width,
+        height: info.size().height,
+        fps_num: info.framerate().num,
+        fps_denom: info.framerate().denom,
+        stride,
+        node_id,
+    })
+}
+
 fn reply_buffers(stream: &pw::stream::Stream, neg: Negotiated, max_buffers: u32) {
     let num_planes = neg.format.planes(neg.width, neg.height).len() as u32;
-    // Match the C reference: reply with ParamBuffers first,
-    // then ParamMeta. No ParamLatency in the reply (the C reference doesn't
-    // send one; the v4l2 bridge may not expect it).
+    // Match the C reference: reply with ParamBuffers first, then ParamMeta.
     let blobs: Vec<Vec<u8>> = vec![
         pod::buffers_pod(neg.stride, neg.height, num_planes, max_buffers),
         pod::meta_pod(),
@@ -595,18 +606,13 @@ fn process_buffer(stream: &pw::stream::Stream, inner: &mut Inner, buf: *mut pw::
     // SAFETY: `buf` is non-null (checked by the caller) and stream-owned.
     let sbuf: *mut pw::spa::sys::spa_buffer = unsafe { (*buf).buffer };
 
-    // Rebuild the `datas` slice exactly like the safe `Buffer::datas_mut`
-    // does (same null/length guards, same cast — `Data` is
-    // `#[repr(transparent)]` over `spa_data`).
-    let mut empty: [Data; 0] = [];
-    let datas: &mut [Data] = unsafe {
-        if !sbuf.is_null() && (*sbuf).n_datas > 0 && !(*sbuf).datas.is_null() {
-            std::slice::from_raw_parts_mut((*sbuf).datas as *mut Data, (*sbuf).n_datas as usize)
-        } else {
-            &mut empty
-        }
-    };
     let layout = neg.format.planes(neg.width, neg.height);
+    // `empty` is a local fallback for buffers with no `datas` (e.g. a plain
+    // audio buffer). A zero-length `&mut` can be returned into the caller,
+    // so `build_planes` stays total and `on_process`'s queue call is
+    // reachable.
+    let mut empty: [Data; 0] = [];
+    let datas = datas_of_buffer(sbuf, &mut empty);
     let Some(planes) = build_planes(datas, &layout) else {
         return;
     };
@@ -632,6 +638,20 @@ fn process_buffer(stream: &pw::stream::Stream, inner: &mut Inner, buf: *mut pw::
         planes,
     };
     (inner.fill)(&mut frame, &neg);
+}
+
+/// The buffer's `datas` slice, exactly like the safe `Buffer::datas_mut`
+/// rebuilds it (same null/length guards, same cast — `Data` is
+/// `#[repr(transparent)]` over `spa_data`). `empty` is the fallback for a
+/// buffer with no `datas` regions.
+fn datas_of_buffer(sbuf: *mut pw::spa::sys::spa_buffer, empty: &mut [Data; 0]) -> &mut [Data] {
+    unsafe {
+        if !sbuf.is_null() && (*sbuf).n_datas > 0 && !(*sbuf).datas.is_null() {
+            std::slice::from_raw_parts_mut((*sbuf).datas as *mut Data, (*sbuf).n_datas as usize)
+        } else {
+            empty
+        }
+    }
 }
 
 /// Write the `SPA_META_Header` meta (`flags`, `offset`, `pts`, `dts_offset`,
