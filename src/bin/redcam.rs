@@ -5,8 +5,8 @@
 //! redcam [--name NAME] [--mode WxH@FPS]...
 //! ```
 //!
-//! Default: one mode, 1920x1080@30, all supported raw formats
-//! (RGBA/BGRA/BGRx/RGBx/BGR/RGB/I420/NV12/NV21/YUY2/UYVY/GREY).
+//! Default: one mode, 1920x1080@30, all packed raw formats
+//! (RGBA/BGRA/BGRx/RGBx/BGR/RGB/YUY2/UYVY/GREY).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,8 +20,8 @@ fn fill_solid(p: &mut Plane, value: u8) {
     p.data[..n].fill(value);
 }
 
-/// Fill a packed 4:2:2 (YUY2: Y U Y V) or UYVY (U Y V Y) plane with the
-/// "red" pattern repeated across the row.
+/// Fill a packed format plane with the "red" byte pattern repeated across
+/// the row.
 fn fill_packed(p: &mut Plane, pattern: &[u8]) {
     let n = p.stride as usize * p.height as usize;
     let mut i = 0;
@@ -68,26 +68,11 @@ fn fill_red(frame: &mut pipewire_vircam::Frame, _negotiated: &pipewire_vircam::N
                 red_pattern(frame.format).expect("single-plane formats all have a red pattern");
             fill_packed(&mut frame.planes[0], pattern);
         }
-        // I420: Y plane, U plane, V plane. Red = Y=63 U=104 V=240 (BT.709 limited).
-        Format::I420 => {
-            fill_solid(&mut frame.planes[0], 63);
-            fill_solid(&mut frame.planes[1], 104);
-            fill_solid(&mut frame.planes[2], 240);
-        }
-        // NV12: Y plane, UV interleaved (U,V,U,V,...).
-        Format::Nv12 => {
-            fill_solid(&mut frame.planes[0], 63);
-            fill_packed(&mut frame.planes[1], &[104, 240]);
-        }
-        // NV21: Y plane, VU interleaved (V,U,V,U,...).
-        Format::Nv21 => {
-            fill_solid(&mut frame.planes[0], 63);
-            fill_packed(&mut frame.planes[1], &[240, 104]);
-        }
         // GREY: solid luma.
         Format::Grey => {
             fill_solid(&mut frame.planes[0], 63);
         }
+        // Nothing else to fill (all packed formats handled above).
         _ => {}
     }
 }

@@ -1,19 +1,14 @@
 /*
  * redcam - PipeWire virtual camera that always displays a solid red frame.
  *
- * REFERENCE IMPLEMENTATION (C). Lives in reference/ as a standalone, second
- * implementation that the harness's oracle (redcam-test) verifies. The
- * primary deliverable is the Rust `pipewire-vircam` crate (see ../src); this file
- * not kept in lockstep with the crate's format coverage (it offers only the
- * packed raw formats). Builds to the repo root as `redcam-c` (see Makefile).
+ * REFERENCE IMPLEMENTATION (C). A standalone second implementation that the
+ * harness's oracle (redcam-test) verifies. The primary deliverable is the
+ * Rust `pipewire-vircam` crate (see ../src); this file mirrors its format
+ * coverage (RGBA, BGRA, BGR, RGB, YUY2, UYVY).
  *
- * Creates a PipeWire node (MediaClass "Video/Source") with a fixed
- * 1920x1080 @ 30 fps output, offering packed raw formats RGBA, BGRA, BGR,
- * RGB. Every produced frame is solid red.
- *
- * Modelled after upstream PipeWire examples/video-src.c: a pw_stream with
- * direction OUTPUT, EnumFormat params, format negotiation in param_changed,
- * and a timer that drives frames at the negotiated framerate.
+ * Creates a PipeWire Video/Source node "redcam" with a fixed 1920x1080 @
+ * 30 fps output. Every produced frame is solid red. Works with OBS and
+ * Chrome via PipeWire.
  */
 
 #include <errno.h>
@@ -32,6 +27,12 @@
 #define HEIGHT		1080
 #define FPS		30
 #define MAX_BUFFERS	16
+
+/* Solid red (BT.709 limited-range YUV, 16-235). Same constants as the Rust
+ * redcam.rs and the redcam-test oracle. */
+#define RED_Y		63
+#define RED_U		104
+#define RED_V		240
 
 struct data {
 	struct pw_main_loop	*main_loop;
@@ -57,18 +58,12 @@ static size_t bpp(uint32_t format)
 	case SPA_VIDEO_FORMAT_RGBA:
 	case SPA_VIDEO_FORMAT_BGRA:
 		return 4;
+	case SPA_VIDEO_FORMAT_YUY2:
+	case SPA_VIDEO_FORMAT_UYVY:
+		return 2;
 	default:
 		return 0;
 	}
-}
-
-/* monotonic wall-clock in nanoseconds (CLOCK_MONOTONIC, the same domain
- * the v4l2 node stamps on captured buffers). */
-static uint64_t now_ns(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 /* Write one solid red row of `width` pixels in `format` byte order. */
@@ -107,6 +102,24 @@ static int fill_red_row(uint8_t *row, uint32_t width, uint32_t format)
 			row[4*x + 3] = 0xff; /* A */
 		}
 		break;
+	case SPA_VIDEO_FORMAT_YUY2:
+		/* Packed Y0 U Y1 V — two pixels per group. */
+		for (x = 0; x < width; x += 2) {
+			row[x * 2 + 0] = RED_Y;
+			row[x * 2 + 1] = RED_U;
+			row[x * 2 + 2] = RED_Y;
+			row[x * 2 + 3] = RED_V;
+		}
+		break;
+	case SPA_VIDEO_FORMAT_UYVY:
+		/* Packed U Y V Y — two pixels per group. */
+		for (x = 0; x < width; x += 2) {
+			row[x * 2 + 0] = RED_U;
+			row[x * 2 + 1] = RED_Y;
+			row[x * 2 + 2] = RED_V;
+			row[x * 2 + 3] = RED_Y;
+		}
+		break;
 	default:
 		return -1;
 	}
@@ -120,9 +133,8 @@ static void on_process(void *userdata)
 	struct pw_buffer *b;
 	struct spa_buffer *buf;
 	struct spa_data *d;
-	uint8_t *base;
+	uint32_t w, h, stride, src_stride, n_bytes;
 	int32_t y;
-	size_t row_len;
 
 	if ((b = pw_stream_dequeue_buffer(data->stream)) == NULL) {
 		pw_log_warn("out of buffers: %m");
@@ -130,42 +142,57 @@ static void on_process(void *userdata)
 	}
 	buf = b->buffer;
 	d = buf->datas;
-	base = d[0].data;
-	if (base == NULL)
-		return;
-
-	row_len = (size_t)data->format.size.width * bpp(data->format.format);
-	if (row_len == 0 ||
-	    fill_red_row(row_buf, data->format.size.width,
-			 data->format.format) < 0) {
-		pw_log_error("unsupported negotiated format %u",
-			     data->format.format);
+	if (!d[0].data) {
+		pw_stream_queue_buffer(data->stream, b);
 		return;
 	}
-	for (y = 0; y < (int32_t)data->format.size.height; y++)
-		memcpy(base + y * data->stride, row_buf, row_len);
 
+	w = data->format.size.width;
+	h = data->format.size.height;
+	if (w == 0 || h == 0) {
+		/* Format not negotiated yet. */
+		pw_stream_queue_buffer(data->stream, b);
+		return;
+	}
+
+	/* Use the stride the consumer actually negotiated (from the buffer
+	 * chunk), falling back to width * bpp. */
+	stride = d[0].chunk->stride ? (uint32_t)d[0].chunk->stride
+			      : w * bpp(data->format.format);
+	src_stride = w * bpp(data->format.format);
+	n_bytes = h * stride;
+
+	if (src_stride == 0 ||
+	    fill_red_row(row_buf, w, data->format.format) < 0) {
+		pw_log_error("unsupported negotiated format %u",
+			 data->format.format);
+		pw_stream_queue_buffer(data->stream, b);
+		return;
+	}
+
+	/* Copy row-by-row: source rows are src_stride wide, destination
+	 * rows are stride wide (honouring negotiated alignment). */
+	for (y = 0; y < (int32_t)h; y++)
+		memcpy(d[0].data + (size_t)y * stride, row_buf, src_stride);
+
+	/* Set chunk metadata after the fill. */
+	d[0].chunk->offset = 0;
+	d[0].chunk->size = (uint32_t)n_bytes;
+	d[0].chunk->stride = (int32_t)stride;
+
+	/* Fill the Header meta (PTS / seq).
+	 * Use pw_stream_get_nsec for the PipeWire clock domain. */
 	{
 		struct spa_meta *m;
-
-		/* Fill the header meta with seq + pts. Best-effort: only
-		 * write when the meta is actually present and fully
-		 * sized. We never write a partial 32-byte struct, so a
-		 * smaller (e.g. 8-byte) allocation can't be corrupted. */
 		if ((m = spa_buffer_find_meta(buf, SPA_META_Header)) != NULL &&
 		    m->size >= sizeof(struct spa_meta_header)) {
-			struct spa_meta_header *h = m->data;
-			h->flags = 0;
-			h->offset = 0;
-			h->seq = data->seq++;
-			h->pts = (int64_t)now_ns();
-			h->dts_offset = 0;
+			struct spa_meta_header *hdr = m->data;
+			hdr->flags = 0;
+			hdr->pts = pw_stream_get_nsec(data->stream);
+			hdr->dts_offset = 0;
+			hdr->seq = data->seq++;
 		}
 	}
-
-	d[0].chunk->offset = 0;
-	d[0].chunk->size = (uint32_t)(data->format.size.height * data->stride);
-	d[0].chunk->stride = data->stride;
 
 	pw_stream_queue_buffer(data->stream, b);
 }
@@ -197,12 +224,14 @@ static void on_stream_state_changed(void *userdata,
 	case PW_STREAM_STATE_STREAMING:
 		{
 			struct timespec timeout, interval;
+			bool driving = pw_stream_is_driving(data->stream);
+			bool lazy = pw_stream_is_lazy(data->stream);
 
-			printf("driving:%d lazy:%d\n",
-			       pw_stream_is_driving(data->stream),
-			       pw_stream_is_lazy(data->stream));
-			if (pw_stream_is_driving(data->stream) !=
-			    pw_stream_is_lazy(data->stream)) {
+			printf("driving:%d lazy:%d\n", (int)driving, (int)lazy);
+			/* We drive the clock when the stream says we're driving
+			 * AND the consumer isn't lazy (pulling on demand). In that
+			 * case arm the timer at the negotiated frame rate. */
+			if (driving && !lazy) {
 				timeout.tv_sec = 0;
 				timeout.tv_nsec = 1;
 				interval.tv_sec = 0;
@@ -216,6 +245,17 @@ static void on_stream_state_changed(void *userdata,
 					NULL, false);
 			}
 		}
+		break;
+	case PW_STREAM_STATE_ERROR:
+		data->streaming = false;
+		pw_loop_update_timer(loop, data->timer, NULL, NULL, false);
+		/* "no target node available" is the normal idle state for a
+		 * camera with no consumer (e.g. no browser tab yet). Keep the
+		 * node registered so that Chrome / OBS can find it and connect.
+		 * A different error would also be tolerated here: the node
+		 * stays up and the user can kill it or let it retry. */
+		if (error && strcmp(error, "no target node available") != 0)
+			pw_log_error("stream error: %s", error);
 		break;
 	default:
 		break;
@@ -249,24 +289,25 @@ static void on_stream_param_changed(void *userdata, uint32_t id,
 	       data->format.framerate.denom,
 	       data->stride);
 
-	/* Accept the negotiated format: reply with our buffer requirements. */
+	/* Reply with ParamBuffers + ParamMeta. */
 	params[n_params++] = spa_pod_builder_add_object(&b,
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
 		SPA_PARAM_BUFFERS_buffers,
 		SPA_POD_CHOICE_RANGE_Int(4, 2, MAX_BUFFERS),
 		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
 		SPA_PARAM_BUFFERS_size,
-		SPA_POD_Int(data->stride * data->format.size.height),
+		SPA_POD_Int((int32_t)(data->stride * data->format.size.height)),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(data->stride));
 	params[n_params++] = spa_pod_builder_add_object(&b,
 		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-		SPA_PARAM_META_type, SPA_POD_Int(SPA_META_Header),
+		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
 		SPA_PARAM_META_size,
 		SPA_POD_Int(sizeof(struct spa_meta_header)));
 	pw_stream_update_params(data->stream, params, n_params);
 }
 
 static const struct pw_stream_events stream_events = {
+	PW_VERSION_STREAM_EVENTS,
 	.process = on_process,
 	.state_changed = on_stream_state_changed,
 	.param_changed = on_stream_param_changed,
@@ -302,8 +343,9 @@ int main(int argc, char *argv[])
 		SPA_VIDEO_FORMAT_BGRA,
 		SPA_VIDEO_FORMAT_BGR,
 		SPA_VIDEO_FORMAT_RGB,
+		SPA_VIDEO_FORMAT_YUY2,
+		SPA_VIDEO_FORMAT_UYVY,
 	};
-	const struct spa_rectangle rect = SPA_RECTANGLE(WIDTH, HEIGHT);
 	size_t i;
 
 	pw_init(&argc, &argv);
@@ -344,33 +386,36 @@ int main(int argc, char *argv[])
 			NULL));
 
 	for (i = 0; i < sizeof(fmts) / sizeof(fmts[0]); i++) {
-		params[n_params++] = spa_pod_builder_add_object(&b,
-			SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-			SPA_FORMAT_mediaType,
-			SPA_POD_Id(SPA_MEDIA_TYPE_video),
-			SPA_FORMAT_mediaSubtype,
-			SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-			SPA_FORMAT_VIDEO_format, SPA_POD_Id(fmts[i]),
-			/* Plain (fixed) values, not choices: OBS's camera-portal
-			 * requires a plain Rectangle for size and rejects range
-			 * framerates; a plain fraction is accepted. */
-			SPA_FORMAT_VIDEO_size,
-			SPA_POD_Rectangle(&rect),
-			SPA_FORMAT_VIDEO_framerate,
-			SPA_POD_Fraction(&SPA_FRACTION(FPS, 1)));
+		/* Video raw info POD with colorimetry (limited range, BT.601
+		 * matrix, BT.709 transfer + primaries) matching a real webcam —
+		 * Chrome requires this. */
+		struct spa_video_info_raw info;
+		memset(&info, 0, sizeof(info));
+		info.format = fmts[i];
+		info.size = SPA_RECTANGLE(WIDTH, HEIGHT);
+		info.framerate.num = FPS;
+		info.framerate.denom = 1;
+		info.color_range = SPA_VIDEO_COLOR_RANGE_16_235;
+		info.color_matrix = SPA_VIDEO_COLOR_MATRIX_BT601;
+		info.transfer_function = SPA_VIDEO_TRANSFER_BT709;
+		info.color_primaries = SPA_VIDEO_COLOR_PRIMARIES_BT709;
+		params[n_params++] = spa_format_video_raw_build(&b,
+				SPA_PARAM_EnumFormat, &info);
 	}
 
 	/* ask for a header meta (seq) alongside the video data */
 	params[n_params++] = spa_pod_builder_add_object(&b,
 		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-		SPA_PARAM_META_type, SPA_POD_Int(SPA_META_Header),
+		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
 		SPA_PARAM_META_size,
 		SPA_POD_Int(sizeof(struct spa_meta_header)));
 
 	pw_stream_add_listener(data.stream, &data.stream_hook,
 			       &stream_events, &data);
 	data.res = pw_stream_connect(data.stream, PW_DIRECTION_OUTPUT,
-				     PW_ID_ANY, PW_STREAM_FLAG_DRIVER,
+				     PW_ID_ANY,
+					     PW_STREAM_FLAG_DRIVER |
+					     PW_STREAM_FLAG_MAP_BUFFERS,
 				     params, n_params);
 
 cleanup:

@@ -3,6 +3,27 @@
 # Builds redcam + C oracle, runs live PipeWire sequences, asserts pixels.
 # Requires: a running PipeWire/WirePlumber session (wpctl).
 # Usage: ./e2e.sh
+#
+# What this verifies:
+#   - Node registration (node.name, media.class, media.role)
+#   - Frame content (red pixels, correct size, correct fps)
+#   - Frame metadata (sequence numbers, PTS monotonicity)
+#   - Clean teardown (node gone after exit, no stream errors)
+#
+# What this does NOT verify (but is required for Chrome):
+#   - Colorimetry in EnumFormat POD (colorRange, colorMatrix, etc.)
+#   - MAP_BUFFERS flag on stream connect
+#   - Header meta negotiation
+#   - video/x-yuy2/{width,height,fps} node properties
+#
+# For Chrome compatibility, these must match the C reference implementation
+# (reference/redcam.c), which has been manually verified to work with Chrome.
+#
+# To manually verify Chrome compatibility:
+#   1. Run: ./redcam --mode 1920x1080@30
+#   2. Open Chrome and go to chrome://media-internals/
+#   3. Select the "redcam" virtual camera
+#   4. Verify that red frames are captured at 1920x1080 @ 30fps
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -150,13 +171,12 @@ run_full_sequence() {
         fail "sequence $seq: not visible in wpctl status"
     fi
 
-    for FMT in rgba bgra bgrx rgbx bgr rgb i420 nv12 nv21 yuy2 uyvy grey; do
+    for FMT in rgba bgra bgrx rgbx bgr rgb yuy2 uyvy grey; do
         oracle_check "$seq" "$FMT" "$FMT red + 1920x1080 + ~30fps" --format "$FMT"
     done
 
     gst_check "$seq" rgba "video/x-raw,format=RGBA,width=1920,height=1080,framerate=30/1" 200 30 30
-    gst_check "$seq" i420 "video/x-raw,format=I420,width=1920,height=1080,framerate=30/1" 150 60 60
-    gst_check "$seq" nv12 "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1" 150 60 60
+    gst_check "$seq" yuy2 "video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1" 150 60 60
 
     assert_clean_teardown "$seq"
 }
@@ -173,9 +193,9 @@ run_sizefps_sequence() {
 
     for SPEC in \
         "1920x1080 30 rgba" \
-        "1920x1080 30 i420" \
+        "1920x1080 30 yuy2" \
         "1280x720 60 rgba" \
-        "1280x720 60 nv12" \
+        "1280x720 60 yuy2" \
         "640x480 15 rgba" \
         "640x480 15 grey"; do
         set -- $SPEC

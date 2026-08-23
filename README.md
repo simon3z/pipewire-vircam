@@ -32,8 +32,8 @@ This repo is a **library + a working demo** that proves it end to end:
    example *and* the target of the self-evaluation harness below, so "it
    works" is a machine-checked fact, not a claim.
 
-Supports the uncompressed raw formats (RGBA/BGRA/BGRx/RGBx/BGR/RGB and
-I420/NV12/NV21/YUY2/UYVY/GREY) and multiple modes per camera.
+Supports the packed uncompressed raw formats (RGBA/BGRA/BGRx/RGBx/BGR/RGB/
+YUY2/UYVY/GREY) and multiple modes per camera.
 
 No v4l2loopback, no ffmpeg, no Python — just the official `pipewire` Rust
 crate and a small harness that proves, with no human eyeballing, that a real
@@ -144,8 +144,7 @@ use pipewire_vircam::{Camera, Config, Format, Mode, Negotiated};
 
 fn fill(frame: &mut pipewire_vircam::Frame, _negotiated: &Negotiated) {
     // `frame` is self-describing: the negotiated format/size plus one plane
-    // per buffer. Packed formats have one plane; planar YUV has several
-    // (Y, then U/V or interleaved UV). Fill every plane.
+    // per buffer. Packed formats have one plane. Fill it.
     for plane in &mut frame.planes {
         let len = (plane.stride * plane.height) as usize;
         // ... write your pixels into plane.data[..len] ...
@@ -215,8 +214,8 @@ multi-size/multi-fps sequence) starts the camera and checks:
    (full sequences).
 3. **Core assertion** — `redcam-test` (the independent C oracle) captures 30
    frames per check and proves every pixel is red, the size is exact, and fps
-   is within [24, 40] of the requested rate — for each of the 12 formats
-   (full sequences) and for six size/fps/format combinations
+   is within [24, 40] of the requested rate — for each of the 9 packed
+   formats (full sequences) and for six size/fps/format combinations
    (1920×1080@30, 1280×720@60, 640×480@15).
 4. **Real-app integration** — a GStreamer `pipewiresrc → videoconvert →
    pngenc` pipeline captures a frame from the node; the PNG is verified to be
@@ -267,12 +266,16 @@ approach.
   `pw_stream_is_lazy`, which has no safe wrapper).
 - **`pw_stream`** API (as in upstream `video-src.c` / `video-play.c`), not a
   raw SPA node export — it handles buffer allocation and negotiation plumbing.
-- **Fixed spec, all uncompressed formats.** The demo advertises 1920×1080@30
-  with every format the crate can fill byte-exactly (the packed RGB family and
-  I420/NV12/NV21/YUY2/UYVY/GREY), so we never negotiate a format we can't
+- **Fixed spec, packed uncompressed formats.** The demo advertises 1920×1080@30
+  with every packed format the crate can fill byte-exactly (RGBA/BGRA/BGRx/
+  RGBx/BGR/RGB/YUY2/UYVY/GREY), so we never negotiate a format we can't
   produce exactly. For YUV, "red" is filled as the BT.709 limited-range
   equivalent (Y=63, Cb=104, Cr=240); MJPG and 10/16-bit formats are excluded
-  (they need an encoder or aren't raw).
+  (they need an encoder or aren't raw). Planar (I420/NV12/NV21) is not
+  supported: Chrome negotiates a planar format and then churns (repeated
+  Paused/Streaming re-negotiation) instead of playing, so it is excluded
+  until the Chrome-side rejection of the planar buffer path is fixed; it
+  will be reintroduced once planar works.
 - **`EnumFormat` size is *plain*; framerate may be a `Choice`.** The size is a
   plain `Rectangle` (not `CHOICE_RANGE`) — apps like OBS parse the size with a
   plain-rectangle parse and silently drop entries whose size is a choice
@@ -286,13 +289,9 @@ approach.
   the value `0`) makes gstreamer-pipewire request DmaBuf-only buffers, and
   the daemon then fails with "alloc buffers: Operation not supported"; the
   v4l2 node emits it only for formats with a real modifier.
-- **`ParamLatency` is advertised (static) and replied with (negotiated).**
-  Two `Latency` objects are advertised (input: unset — no input port;
-  output: 1 frame/buffer, min/max rate = the advertised fps range, min/max
-  ns = the frame period at those rates), and the `ParamBuffers` negotiation
-  reply carries the negotiated frame period (min = max) — what the v4l2
-  driver emits after accepting a Format. Browsers (unlike OBS) validate this
-  param when deciding whether a stream is usable.
+- **The negotiation reply is `ParamBuffers` + a `meta` (Header) request.**
+  No `ParamLatency` is sent (neither at connect nor in the reply), matching
+  the C reference.
 - **Source is the DRIVER**; a 1 ms timer produces at most one frame per
   negotiated period (software pacing, so fps survives renegotiation without
   re-arming). The consumer is passive.

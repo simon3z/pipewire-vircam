@@ -61,8 +61,9 @@ pub use error::Error;
 
 /// A raw (uncompressed) video format the camera can produce.
 ///
-/// All are single- or multi-plane *raw* formats (no compression). MJPG is
-/// deliberately excluded (it needs an encoder).
+/// All are *packed* raw formats (no compression, one plane). MJPG is
+/// deliberately excluded (it needs an encoder); planar (I420/NV12/NV21) is
+/// not supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Format {
@@ -78,12 +79,6 @@ pub enum Format {
     Bgr,
     /// RGB, 3 bytes/pixel.
     Rgb,
-    /// I420: Y plane + planar U and V (4:2:0).
-    I420,
-    /// NV12: Y plane + interleaved UV plane (4:2:0).
-    Nv12,
-    /// NV21: Y plane + interleaved VU plane (4:2:0).
-    Nv21,
     /// YUY2: packed Y U Y V (4:2:2).
     Yuy2,
     /// UYVY: packed U Y V Y (4:2:2).
@@ -102,9 +97,6 @@ const ALL_FORMATS: &[Format] = &[
     Format::Rgbx,
     Format::Bgr,
     Format::Rgb,
-    Format::I420,
-    Format::Nv12,
-    Format::Nv21,
     Format::Yuy2,
     Format::Uvyvy,
     Format::Grey,
@@ -122,9 +114,6 @@ impl Format {
             Format::Rgbx => V::RGBx,
             Format::Bgr => V::BGR,
             Format::Rgb => V::RGB,
-            Format::I420 => V::I420,
-            Format::Nv12 => V::NV12,
-            Format::Nv21 => V::NV21,
             Format::Yuy2 => V::YUY2,
             Format::Uvyvy => V::UYVY,
             Format::Grey => V::GRAY8,
@@ -139,16 +128,6 @@ impl Format {
                 vec![(width * 4, height)]
             }
             Format::Bgr | Format::Rgb => vec![(width * 3, height)],
-            Format::I420 => {
-                vec![
-                    (width, height),
-                    (width / 2, height / 2),
-                    (width / 2, height / 2),
-                ]
-            }
-            Format::Nv12 | Format::Nv21 => {
-                vec![(width, height), (width, height / 2)]
-            }
             Format::Yuy2 | Format::Uvyvy => vec![(width * 2, height)],
             Format::Grey => vec![(width, height)],
         }
@@ -171,7 +150,7 @@ impl Format {
         ALL_FORMATS.iter().copied().find(|f| f.spa_id() == id)
     }
 
-    /// The format's lowercase name (`"rgba"`, `"nv12"`, ...). Inverse of
+    /// The format's lowercase name (`"rgba"`, `"yuy2"`, ...). Inverse of
     /// `Format::from_str`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -181,9 +160,6 @@ impl Format {
             Format::Rgbx => "rgbx",
             Format::Bgr => "bgr",
             Format::Rgb => "rgb",
-            Format::I420 => "i420",
-            Format::Nv12 => "nv12",
-            Format::Nv21 => "nv21",
             Format::Yuy2 => "yuy2",
             Format::Uvyvy => "uyvy",
             Format::Grey => "grey",
@@ -333,11 +309,13 @@ mod tests {
         assert!("RGBA".parse::<Format>().is_err());
     }
 
-    /// `from_spa_id` rejects ids we don't support (e.g. MJPG, or garbage).
+    /// `from_spa_id` rejects ids we don't support (e.g. MJPG, planar, or
+    /// garbage).
     #[test]
     fn from_spa_id_rejects_unknown() {
         assert_eq!(Format::from_spa_id(0), None); // SPA_VIDEO_FORMAT_UNKNOWN
-        assert_eq!(Format::from_spa_id(3), None); // YV12 (not supported)
+        assert_eq!(Format::from_spa_id(2), None); // I420 (planar, not supported)
+        assert_eq!(Format::from_spa_id(3), None); // YV12 (planar, not supported)
         assert_eq!(Format::from_spa_id(9999), None);
         assert_eq!(Format::from_spa_id(u32::MAX), None);
     }
@@ -354,14 +332,6 @@ mod tests {
         assert_eq!(Format::Rgbx.planes(w, h), vec![(w * 4, h)]);
         assert_eq!(Format::Bgr.planes(w, h), vec![(w * 3, h)]);
         assert_eq!(Format::Rgb.planes(w, h), vec![(w * 3, h)]);
-        // I420: Y + planar U,V (half resolution each).
-        assert_eq!(
-            Format::I420.planes(w, h),
-            vec![(w, h), (w / 2, h / 2), (w / 2, h / 2)]
-        );
-        // NV12/NV21: Y + interleaved UV/VU (half resolution).
-        assert_eq!(Format::Nv12.planes(w, h), vec![(w, h), (w, h / 2)]);
-        assert_eq!(Format::Nv21.planes(w, h), vec![(w, h), (w, h / 2)]);
         // Packed 4:2:2: 2 bytes/pixel, one plane.
         assert_eq!(Format::Yuy2.planes(w, h), vec![(w * 2, h)]);
         assert_eq!(Format::Uvyvy.planes(w, h), vec![(w * 2, h)]);

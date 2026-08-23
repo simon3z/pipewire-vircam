@@ -36,9 +36,8 @@ pub struct Plane<'f> {
 /// Self-describing: the negotiated geometry is on the view itself, so your
 /// code can adapt to whatever the consumer picked (format, size, planes).
 ///
-/// `planes` is ordered by plane index (0 = luma/primary). For packed
-/// formats there is exactly one plane. For I420 there are three (Y, U, V);
-/// for NV12/NV21 two (Y, then interleaved UV/VU).
+/// `planes` is ordered by plane index (0 = luma/primary). All supported
+/// formats are packed, so there is always exactly one plane.
 pub struct Frame<'f> {
     pub width: u32,
     pub height: u32,
@@ -62,33 +61,13 @@ pub struct Frame<'f> {
 }
 
 impl<'f> Frame<'f> {
-    /// Fill all planes with a neutral "black" value appropriate for the
-    /// format: packed RGB fills zero; planar/interleaved YUV sets luma to 0
-    /// and chroma to 128 (neutral). Use this while your pipeline is not
-    /// ready instead of `p.data.fill(0)`, which leaves undefined chroma for
-    /// YUV formats.
+    /// Fill the (single) plane with a neutral "black" value: packed formats
+    /// fill zero. Use this while your pipeline is not ready instead of
+    /// `p.data.fill(0)`, which leaves undefined chroma for YUV formats.
     pub fn fill_black(&mut self) {
-        let planes = std::mem::take(&mut self.planes);
-        // SAFETY: the planes are disjoint spa_data elements taken from one
-        // live buffer; `fill` on each is independent. We move them out and
-        // back so the per-plane borrows don't overlap in the type system.
-        for (i, p) in planes.into_iter().enumerate() {
-            let Plane {
-                stride,
-                height,
-                data,
-            } = p;
-            let mut plane = Plane {
-                stride,
-                height,
-                data,
-            };
-            match (self.format, i) {
-                (Format::I420, 0) | (Format::Nv12, 0) | (Format::Nv21, 0) => plane.fill(0),
-                (Format::I420, 1) | (Format::I420, 2) => plane.fill(128),
-                (Format::Nv12, 1) | (Format::Nv21, 1) => plane.fill_interleaved(128, 128),
-                _ => plane.fill(0),
-            }
+        // Fill every plane with a neutral "black" value.
+        for plane in &mut self.planes {
+            plane.fill(0);
         }
     }
 }
@@ -97,17 +76,6 @@ impl Plane<'_> {
     fn fill(&mut self, value: u8) {
         let n = (self.stride * self.height) as usize;
         self.data[..n].fill(value);
-    }
-
-    /// Fill an interleaved two-byte plane (UV/VU) with alternating values.
-    fn fill_interleaved(&mut self, a: u8, b: u8) {
-        let n = (self.stride * self.height) as usize;
-        let mut i = 0;
-        while i + 1 < n {
-            self.data[i] = a;
-            self.data[i + 1] = b;
-            i += 2;
-        }
     }
 }
 
@@ -287,7 +255,10 @@ impl Camera {
                 stream.as_raw_ptr(),
                 Direction::Output.as_raw(),
                 pw::constants::ID_ANY,
-                pw::stream::StreamFlags::DRIVER.bits(),
+                // DRIVER: we own the clock. MAP_BUFFERS: Chrome requires
+                // this to map buffers into its address space (matches
+                // the C reference).
+                (pw::stream::StreamFlags::DRIVER | pw::stream::StreamFlags::MAP_BUFFERS).bits(),
                 pod_ptrs.as_mut_ptr(),
                 pod_ptrs.len() as u32,
             )
@@ -576,10 +547,12 @@ fn on_param_changed(
 /// buffer — the same value the driver timer paces by.
 fn reply_buffers(stream: &pw::stream::Stream, neg: Negotiated, max_buffers: u32) {
     let num_planes = neg.format.planes(neg.width, neg.height).len() as u32;
+    // Match the C reference: reply with ParamBuffers first,
+    // then ParamMeta. No ParamLatency in the reply (the C reference doesn't
+    // send one; the v4l2 bridge may not expect it).
     let blobs: Vec<Vec<u8>> = vec![
-        pod::meta_pod(),
         pod::buffers_pod(neg.stride, neg.height, num_planes, max_buffers),
-        pod::negotiated_latency_pod(neg.fps_num, neg.fps_denom),
+        pod::meta_pod(),
     ];
     let _ = pw_stream_update_params_ptr(stream.as_raw_ptr(), &blobs);
 }
@@ -607,14 +580,14 @@ fn on_process(stream: &pw::stream::Stream, inner: &mut Inner) {
     // — all locals borrow only within that function). Queueing recycles the
     // buffer; it is not dropped here.
     unsafe {
-        process_buffer(inner, buf);
+        process_buffer(stream, inner, buf);
         pw::sys::pw_stream_queue_buffer(stream.as_raw_ptr(), buf);
     }
 }
 
 /// Stamp the buffer's timing (seq/pts), build the [`Frame`] views and call
 /// the user fill handler. The buffer is queued back by the caller.
-fn process_buffer(inner: &mut Inner, buf: *mut pw::sys::pw_buffer) {
+fn process_buffer(stream: &pw::stream::Stream, inner: &mut Inner, buf: *mut pw::sys::pw_buffer) {
     // Snapshot the negotiation for this buffer. `negotiated` may be replaced
     // by a later `param_changed` (renegotiation), so every field used below
     // comes from this local copy.
@@ -640,10 +613,12 @@ fn process_buffer(inner: &mut Inner, buf: *mut pw::sys::pw_buffer) {
 
     // Stamp the Header meta *before* the fill callback, so `pts` is the
     // frame's presentation time and the user can render for it. `seq` is the
-    // per-camera frame counter, `pts` the monotonic now (ns since start).
+    // per-camera frame counter, `pts` from the PipeWire clock (matches
+    // the C reference).
     let seq = inner.seq;
     inner.seq += 1;
-    let pts = now_ns();
+    // SAFETY: `stream` is alive and we're on the main-loop thread.
+    let pts = unsafe { pw::sys::pw_stream_get_nsec(stream.as_raw_ptr()) } as u64;
     write_header_meta(sbuf, seq, pts);
 
     let mut frame = Frame {

@@ -24,8 +24,8 @@ fn bench_format_planes() {
     let iterations = 1_000_000;
     for _ in 0..iterations {
         let _ = Format::Rgba.planes(w, h);
-        let _ = Format::I420.planes(w, h);
-        let _ = Format::Nv12.planes(w, h);
+        let _ = Format::Yuy2.planes(w, h);
+        let _ = Format::Bgr.planes(w, h);
     }
     let elapsed = start.elapsed();
     let ns_per_call = elapsed.as_nanos() as u64 / (iterations * 3) as u64;
