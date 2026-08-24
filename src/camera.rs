@@ -61,13 +61,55 @@ pub struct Frame<'f> {
 }
 
 impl<'f> Frame<'f> {
-    /// Fill the (single) plane with a neutral "black" value: packed formats
-    /// fill zero. Use this while your pipeline is not ready instead of
-    /// `p.data.fill(0)`, which leaves undefined chroma for YUV formats.
+    /// Fill the (single) plane with a neutral "black" value: packed RGB
+    /// formats fill zero; packed YUV formats fill Y=0, U=128, V=128 (neutral
+    /// chroma). Use this while your pipeline is not ready instead of
+    /// `plane.data.fill(0)`, which leaves undefined chroma for YUV formats
+    /// (YUY2 with U=0, V=0 reads as green).
     pub fn fill_black(&mut self) {
-        // Fill every plane with a neutral "black" value.
-        for plane in &mut self.planes {
-            plane.fill(0);
+        match self.format {
+            Format::Yuy2 => self.fill_yuy2_black(),
+            Format::Uvyvy => self.fill_uvyvy_black(),
+            // Packed RGB / grayscale: all-zero is neutral black.
+            _ => {
+                for plane in &mut self.planes {
+                    plane.fill(0);
+                }
+            }
+        }
+    }
+
+    /// Fill a YUY2 plane with Y=0, U=128, V=128 (neutral black). Layout is
+    /// `Y0 U0 Y1 V1` per row of `width/2` pixel pairs.
+    fn fill_yuy2_black(&mut self) {
+        let plane = &mut self.planes[0];
+        let rows = plane.height as usize;
+        let stride = plane.stride as usize;
+        for r in 0..rows {
+            let row = &mut plane.data[r * stride..(r + 1) * stride];
+            for c in 0..row.len().div_ceil(4) {
+                row[4 * c] = 0; // Y0
+                row[4 * c + 1] = 128; // U0
+                row[4 * c + 2] = 0; // Y1
+                row[4 * c + 3] = 128; // V1
+            }
+        }
+    }
+
+    /// Fill a UYVY plane with Y=0, U=128, V=128 (neutral black). Layout is
+    /// `U0 Y0 V1 Y1` per row of `width/2` pixel pairs.
+    fn fill_uvyvy_black(&mut self) {
+        let plane = &mut self.planes[0];
+        let rows = plane.height as usize;
+        let stride = plane.stride as usize;
+        for r in 0..rows {
+            let row = &mut plane.data[r * stride..(r + 1) * stride];
+            for c in 0..row.len().div_ceil(4) {
+                row[4 * c] = 128; // U0
+                row[4 * c + 1] = 0; // Y0
+                row[4 * c + 2] = 128; // V1
+                row[4 * c + 3] = 0; // Y1
+            }
         }
     }
 }
@@ -796,5 +838,77 @@ mod tests {
         write_header_meta(buf, 42, 1_000_000_000);
 
         assert_eq!(payload, 0);
+    }
+
+    /// Build a `Frame` with a single `width x height` plane of `format`, all
+    /// bytes initialized to 0. Used by the `fill_black` tests below.
+    fn test_frame(format: Format, width: u32, height: u32) -> Frame<'static> {
+        // SAFETY: `Frame` is a plain data struct; we construct one directly
+        // with a `Vec`-backed plane so the test owns the memory. The
+        // `fps_num`/`fps_denom`/`seq`/`pts` fields are irrelevant to
+        // `fill_black`.
+        let stride = match format {
+            Format::Yuy2 | Format::Uvyvy => width * 2,
+            _ => width * 4,
+        };
+        let data = vec![0u8; (stride * height) as usize];
+        // Leak the `Vec` into a `&'static mut [u8]` so we can return a
+        // `Frame<'static>` from the helper. The test process exits after
+        // each `#[test]`, so the leaked memory is reclaimed by the OS.
+        let data: &'static mut [u8] = Box::leak(data.into_boxed_slice());
+        Frame {
+            width,
+            height,
+            format,
+            fps_num: 30,
+            fps_denom: 1,
+            seq: 0,
+            pts: 0,
+            planes: vec![Plane {
+                stride,
+                height,
+                data,
+            }],
+        }
+    }
+
+    /// YUY2: `fill_black` must produce Y=0, U=128, V=128 (neutral black).
+    /// Filling zero (the old behavior) reads as green because U=0, V=0 is
+    /// the most-saturated blue/cyan chroma.
+    #[test]
+    fn fill_black_yuy2_is_neutral() {
+        let mut f = test_frame(Format::Yuy2, 4, 2); // 8 px, 2 rows of 8 bytes
+        f.fill_black();
+        // Each row is Y U Y V pairs. For width=4, stride=8, one row has
+        // 2 (Y,U,Y,V) quads: bytes [0,128,0,128, 0,128,0,128].
+        let expected_row: [u8; 8] = [0, 128, 0, 128, 0, 128, 0, 128];
+        for r in 0..2 {
+            assert_eq!(f.planes[0].data[r * 8..r * 8 + 8], expected_row);
+        }
+    }
+
+    /// UYVY: `fill_black` must produce U=128, Y=0, V=128, Y=0 (neutral
+    /// black). Layout is U Y V Y per quad (opposite byte order to YUY2).
+    #[test]
+    fn fill_black_uvyvy_is_neutral() {
+        let mut f = test_frame(Format::Uvyvy, 4, 2);
+        f.fill_black();
+        let expected_row: [u8; 8] = [128, 0, 128, 0, 128, 0, 128, 0];
+        for r in 0..2 {
+            assert_eq!(f.planes[0].data[r * 8..r * 8 + 8], expected_row);
+        }
+    }
+
+    /// Packed RGB / grayscale: `fill_black` is all-zero (unchanged from the
+    /// old behavior).
+    #[test]
+    fn fill_black_rgba_is_zero() {
+        let mut f = test_frame(Format::Rgba, 4, 2);
+        f.fill_black();
+        for r in 0..2 {
+            assert!(f.planes[0].data[r * 16..r * 16 + 16]
+                .iter()
+                .all(|&b| b == 0));
+        }
     }
 }

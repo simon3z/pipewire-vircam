@@ -2,6 +2,13 @@
 
 All notable changes to this crate, per release.
 
+## 0.7.1
+
+- Fix: `Frame::fill_black` now writes neutral chroma for YUV formats
+  (Y=0, U=128, V=128 for YUY2/UYVY) instead of all-zero. The old behavior
+  left U=0, V=0, which reads as green on YUY2/UYVY consumers. Packed RGB
+  and grayscale are unchanged (all-zero).
+
 ## 0.7.0
 
 - **Breaking:** removed the planar formats `Format::I420`, `Format::Nv12`,
